@@ -156,6 +156,32 @@ npm start
 npm run start:skip-zero
 ```
 
+## 4.1 Nginx reverse proxy
+
+Example config for `etokendb.alitayin.com` is included at:
+
+`deploy/nginx/etokendb.alitayin.com.conf`
+
+Typical Ubuntu setup:
+
+```bash
+sudo apt install -y nginx
+sudo cp deploy/nginx/etokendb.alitayin.com.conf /etc/nginx/sites-available/etokendb.alitayin.com
+sudo ln -s /etc/nginx/sites-available/etokendb.alitayin.com /etc/nginx/sites-enabled/etokendb.alitayin.com
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+After nginx is working on port `80`, enable HTTPS:
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d etokendb.alitayin.com
+```
+
+After you proxy through nginx, you usually do not need public access to `8787` anymore.
+You can keep the app bound to `127.0.0.1:8787` behind nginx and close public firewall/security-group access to `8787`.
+
 ## 5. Token ranking and descending order
 
 Yes. Token lists support both sorting and descending order.
