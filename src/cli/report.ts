@@ -111,6 +111,8 @@ async function main(): Promise<void> {
                 SUM(CAST(recent_144_volume_sats AS INTEGER)) AS recent_144_volume_sats_sum,
                 SUM(recent_1008_trade_count) AS recent_1008_trade_count_sum,
                 SUM(CAST(recent_1008_volume_sats AS INTEGER)) AS recent_1008_volume_sats_sum,
+                SUM(recent_4320_trade_count) AS recent_4320_trade_count_sum,
+                SUM(CAST(recent_4320_volume_sats AS INTEGER)) AS recent_4320_volume_sats_sum,
                 MAX(last_trade_block_height) AS latest_trade_block_height,
                 MAX(last_trade_block_timestamp) AS latest_trade_block_timestamp
               FROM token_stats
@@ -136,6 +138,8 @@ async function main(): Promise<void> {
                 recent_144_volume_sats,
                 recent_1008_trade_count,
                 recent_1008_volume_sats,
+                recent_4320_trade_count,
+                recent_4320_volume_sats,
                 last_trade_block_height,
                 last_trade_block_timestamp
               FROM token_stats
@@ -180,6 +184,8 @@ async function main(): Promise<void> {
                 s.recent_144_volume_sats,
                 s.recent_1008_trade_count,
                 s.recent_1008_volume_sats,
+                s.recent_4320_trade_count,
+                s.recent_4320_volume_sats,
                 s.last_trade_block_height,
                 s.last_trade_block_timestamp,
                 t.last_synced_at

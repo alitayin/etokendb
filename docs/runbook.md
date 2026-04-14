@@ -203,6 +203,8 @@ Supported `sort` values:
 - `recent144VolumeSats`
 - `recent1008TradeCount`
 - `recent1008VolumeSats`
+- `recent4320TradeCount`
+- `recent4320VolumeSats`
 - `lastTradeBlockHeight`
 - `lastTradeBlockTimestamp`
 
@@ -225,6 +227,12 @@ Top tokens by last 1008 blocks volume:
 curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=recent1008VolumeSats&order=desc"
 ```
 
+Top tokens by last 4320 blocks volume:
+
+```bash
+curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=recent4320VolumeSats&order=desc"
+```
+
 Top tokens by total traded volume:
 
 ```bash
@@ -238,6 +246,7 @@ curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=recent1008VolumeS
 ```
 
 `1008` blocks is the current "7 day" window in this product.
+`4320` blocks is the current "30 day" window in this product.
 
 ## 6. Current improvement points and risks
 

@@ -142,6 +142,10 @@ function tokenSortSql(sort: TokenSortField, order: "asc" | "desc"): string {
       return `${numericInt("s.recent_1008_trade_count")} ${direction}, t.token_id ASC`;
     case "recent1008VolumeSats":
       return `${numericText("s.recent_1008_volume_sats")} ${direction}, t.token_id ASC`;
+    case "recent4320TradeCount":
+      return `${numericInt("s.recent_4320_trade_count")} ${direction}, t.token_id ASC`;
+    case "recent4320VolumeSats":
+      return `${numericText("s.recent_4320_volume_sats")} ${direction}, t.token_id ASC`;
     case "lastTradeBlockHeight":
       return `${numericInt("s.last_trade_block_height")} ${direction}, ${numericInt("s.last_trade_block_timestamp")} ${direction}, t.token_id ASC`;
     case "lastTradeBlockTimestamp":
@@ -163,6 +167,8 @@ function toTokenSummary(row: Record<string, unknown>): TokenSummary {
     recent144VolumeSats: String(row.recent_144_volume_sats ?? "0"),
     recent1008TradeCount: Number(row.recent_1008_trade_count ?? 0),
     recent1008VolumeSats: String(row.recent_1008_volume_sats ?? "0"),
+    recent4320TradeCount: Number(row.recent_4320_trade_count ?? 0),
+    recent4320VolumeSats: String(row.recent_4320_volume_sats ?? "0"),
     lastTradeBlockHeight:
       row.last_trade_block_height === null || row.last_trade_block_height === undefined
         ? null
@@ -372,6 +378,8 @@ export class AgoraTokenService implements ServiceReadApi {
             s.recent_144_volume_sats,
             s.recent_1008_trade_count,
             s.recent_1008_volume_sats,
+            s.recent_4320_trade_count,
+            s.recent_4320_volume_sats,
             s.last_trade_block_height,
             s.last_trade_block_timestamp
           FROM tracked_tokens t
@@ -413,6 +421,8 @@ export class AgoraTokenService implements ServiceReadApi {
             s.recent_144_volume_sats,
             s.recent_1008_trade_count,
             s.recent_1008_volume_sats,
+            s.recent_4320_trade_count,
+            s.recent_4320_volume_sats,
             s.last_trade_block_height,
             s.last_trade_block_timestamp
           FROM tracked_tokens t

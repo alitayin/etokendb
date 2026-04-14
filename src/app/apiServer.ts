@@ -67,6 +67,8 @@ const TOKEN_SORT_FIELDS = new Set<TokenSortField>([
   "recent144VolumeSats",
   "recent1008TradeCount",
   "recent1008VolumeSats",
+  "recent4320TradeCount",
+  "recent4320VolumeSats",
   "lastTradeBlockHeight",
   "lastTradeBlockTimestamp",
 ]);

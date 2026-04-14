@@ -95,15 +95,17 @@ function sampleTokenSummary(tokenId = "token-1"): TokenSummary {
     isActive: true,
     isReady: true,
     bootstrapCohort: true,
-    totalTradeCount: 12,
-    totalVolumeSats: "4000",
-    recent144TradeCount: 4,
-    recent144VolumeSats: "1000",
-    recent1008TradeCount: 8,
-    recent1008VolumeSats: "2000",
-    lastTradeBlockHeight: 111,
-    lastTradeBlockTimestamp: 222,
-    lastSyncedAt: 333,
+  totalTradeCount: 12,
+  totalVolumeSats: "4000",
+  recent144TradeCount: 4,
+  recent144VolumeSats: "1000",
+  recent1008TradeCount: 8,
+  recent1008VolumeSats: "2000",
+  recent4320TradeCount: 18,
+  recent4320VolumeSats: "6000",
+  lastTradeBlockHeight: 111,
+  lastTradeBlockTimestamp: 222,
+  lastSyncedAt: 333,
     lastWsEventAt: 444,
   };
 }
@@ -190,13 +192,13 @@ test("list tokens parses pagination and sorting query", async () => {
   const response = await invoke(
     service,
     "GET",
-    "/api/tokens?page=2&pageSize=25&sort=totalTradeCount&order=asc&readyOnly=true",
+    "/api/tokens?page=2&pageSize=25&sort=recent4320VolumeSats&order=asc&readyOnly=true",
   );
   assert.equal(response.statusCode, 200);
   assert.deepEqual(capturedQuery, {
     page: 2,
     pageSize: 25,
-    sort: "totalTradeCount",
+    sort: "recent4320VolumeSats",
     order: "asc",
     readyOnly: true,
   });

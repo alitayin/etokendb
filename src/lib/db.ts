@@ -163,6 +163,8 @@ function createSchema(sqlite: Database.Database): void {
       recent_144_volume_sats TEXT NOT NULL DEFAULT '0',
       recent_1008_trade_count INTEGER NOT NULL DEFAULT 0,
       recent_1008_volume_sats TEXT NOT NULL DEFAULT '0',
+      recent_4320_trade_count INTEGER NOT NULL DEFAULT 0,
+      recent_4320_volume_sats TEXT NOT NULL DEFAULT '0',
       last_trade_offer_txid TEXT,
       last_trade_offer_out_idx INTEGER,
       last_trade_block_height INTEGER,
@@ -210,6 +212,18 @@ function createSchema(sqlite: Database.Database): void {
     sqlite,
     "token_stats",
     "recent_1008_volume_sats",
+    "TEXT NOT NULL DEFAULT '0'",
+  );
+  ensureColumn(
+    sqlite,
+    "token_stats",
+    "recent_4320_trade_count",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  ensureColumn(
+    sqlite,
+    "token_stats",
+    "recent_4320_volume_sats",
     "TEXT NOT NULL DEFAULT '0'",
   );
 }
@@ -272,6 +286,8 @@ function toTokenAggregateStatsRecord(
     recent144VolumeSats: row.recent_144_volume_sats as string,
     recent1008TradeCount: row.recent_1008_trade_count as number,
     recent1008VolumeSats: row.recent_1008_volume_sats as string,
+    recent4320TradeCount: row.recent_4320_trade_count as number,
+    recent4320VolumeSats: row.recent_4320_volume_sats as string,
     updatedAt: row.updated_at as number,
   };
 }
@@ -326,6 +342,10 @@ function buildStatsOrderByClause(
       return `s.recent_1008_trade_count ${direction}, s.token_id ASC`;
     case "recent_1008_volume_sats":
       return `LENGTH(s.recent_1008_volume_sats) ${direction}, s.recent_1008_volume_sats ${direction}, s.token_id ASC`;
+    case "recent_4320_trade_count":
+      return `s.recent_4320_trade_count ${direction}, s.token_id ASC`;
+    case "recent_4320_volume_sats":
+      return `LENGTH(s.recent_4320_volume_sats) ${direction}, s.recent_4320_volume_sats ${direction}, s.token_id ASC`;
     case "last_trade_block_height":
       return `s.last_trade_block_height ${direction} NULLS LAST, s.last_trade_block_timestamp ${direction} NULLS LAST, s.token_id ASC`;
     case "last_trade_block_timestamp":
@@ -666,6 +686,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       recent_144_volume_sats,
       recent_1008_trade_count,
       recent_1008_volume_sats,
+      recent_4320_trade_count,
+      recent_4320_volume_sats,
       last_trade_offer_txid,
       last_trade_offer_out_idx,
       last_trade_block_height,
@@ -684,6 +706,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       recent_144_volume_sats,
       recent_1008_trade_count,
       recent_1008_volume_sats,
+      recent_4320_trade_count,
+      recent_4320_volume_sats,
       last_trade_offer_txid,
       last_trade_offer_out_idx,
       last_trade_block_height,
@@ -697,6 +721,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @recent144VolumeSats,
       @recent1008TradeCount,
       @recent1008VolumeSats,
+      @recent4320TradeCount,
+      @recent4320VolumeSats,
       @lastTradeOfferTxid,
       @lastTradeOfferOutIdx,
       @lastTradeBlockHeight,
@@ -722,6 +748,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       recent_144_volume_sats,
       recent_1008_trade_count,
       recent_1008_volume_sats,
+      recent_4320_trade_count,
+      recent_4320_volume_sats,
       last_trade_offer_txid,
       last_trade_offer_out_idx,
       last_trade_block_height,
@@ -735,6 +763,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @recent144VolumeSats,
       @recent1008TradeCount,
       @recent1008VolumeSats,
+      @recent4320TradeCount,
+      @recent4320VolumeSats,
       @lastTradeOfferTxid,
       @lastTradeOfferOutIdx,
       @lastTradeBlockHeight,
@@ -748,6 +778,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       recent_144_volume_sats = excluded.recent_144_volume_sats,
       recent_1008_trade_count = excluded.recent_1008_trade_count,
       recent_1008_volume_sats = excluded.recent_1008_volume_sats,
+      recent_4320_trade_count = excluded.recent_4320_trade_count,
+      recent_4320_volume_sats = excluded.recent_4320_volume_sats,
       last_trade_offer_txid = excluded.last_trade_offer_txid,
       last_trade_offer_out_idx = excluded.last_trade_offer_out_idx,
       last_trade_block_height = excluded.last_trade_block_height,
@@ -961,6 +993,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         recent144VolumeSats: snapshot.recent144VolumeSats,
         recent1008TradeCount: snapshot.recent1008TradeCount,
         recent1008VolumeSats: snapshot.recent1008VolumeSats,
+        recent4320TradeCount: snapshot.recent4320TradeCount,
+        recent4320VolumeSats: snapshot.recent4320VolumeSats,
         lastTradeOfferTxid: (latestTrade?.offer_txid as string | null) ?? null,
         lastTradeOfferOutIdx:
           (latestTrade?.offer_out_idx as number | null) ?? null,
@@ -979,6 +1013,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         recent144VolumeSats: aggregate.recent144VolumeSats,
         recent1008TradeCount: aggregate.recent1008TradeCount,
         recent1008VolumeSats: aggregate.recent1008VolumeSats,
+        recent4320TradeCount: aggregate.recent4320TradeCount,
+        recent4320VolumeSats: aggregate.recent4320VolumeSats,
         lastTradeOfferTxid: aggregate.lastTradeOfferTxid,
         lastTradeOfferOutIdx: aggregate.lastTradeOfferOutIdx,
         lastTradeBlockHeight: aggregate.lastTradeBlockHeight,
@@ -1029,6 +1065,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         recent144VolumeSats: "0",
         recent1008TradeCount: 0,
         recent1008VolumeSats: "0",
+        recent4320TradeCount: 0,
+        recent4320VolumeSats: "0",
         updatedAt: Date.now(),
       });
     },
@@ -1116,6 +1154,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
           s.recent_144_volume_sats,
           s.recent_1008_trade_count,
           s.recent_1008_volume_sats,
+          s.recent_4320_trade_count,
+          s.recent_4320_volume_sats,
           s.last_trade_offer_txid,
           s.last_trade_offer_out_idx,
           s.last_trade_block_height,

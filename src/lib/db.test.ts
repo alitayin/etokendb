@@ -171,7 +171,7 @@ test("insertProcessedTrades dedupes and updates token_block_stats incrementally"
   }
 });
 
-test("recomputeTokenAggregateStats builds total + 144/1008 windows and keeps backward-compatible updates", () => {
+test("recomputeTokenAggregateStats builds total + 144/1008/4320 windows and keeps backward-compatible updates", () => {
   const db = openDatabase(":memory:");
 
   try {
@@ -183,17 +183,26 @@ test("recomputeTokenAggregateStats builds total + 144/1008 windows and keeps bac
         outIdx: 0,
         spendTxid: "spend-old",
         paidSats: "200",
-        blockHeight: 800,
-        blockTimestamp: 8000,
+        blockHeight: 100,
+        blockTimestamp: 1000,
       }),
       makeTrade({
         tokenId,
-        offerTxid: "offer-mid",
+        offerTxid: "offer-30d",
         outIdx: 0,
-        spendTxid: "spend-mid",
+        spendTxid: "spend-30d",
         paidSats: "300",
-        blockHeight: 950,
-        blockTimestamp: 9500,
+        blockHeight: 2000,
+        blockTimestamp: 20000,
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "offer-week",
+        outIdx: 0,
+        spendTxid: "spend-week",
+        paidSats: "400",
+        blockHeight: 4500,
+        blockTimestamp: 45000,
       }),
       makeTrade({
         tokenId,
@@ -201,38 +210,42 @@ test("recomputeTokenAggregateStats builds total + 144/1008 windows and keeps bac
         outIdx: 0,
         spendTxid: "spend-new",
         paidSats: "50",
-        blockHeight: 1000,
-        blockTimestamp: 10000,
+        blockHeight: 5000,
+        blockTimestamp: 50000,
       }),
     ]);
 
-    const aggregate = db.recomputeTokenAggregateStats(tokenId, 1000);
-    assert.equal(aggregate.tradeCount, 3);
-    assert.equal(aggregate.cumulativePaidSats, "550");
-    assert.equal(aggregate.recent144TradeCount, 2);
-    assert.equal(aggregate.recent144VolumeSats, "350");
-    assert.equal(aggregate.recent1008TradeCount, 3);
-    assert.equal(aggregate.recent1008VolumeSats, "550");
+    const aggregate = db.recomputeTokenAggregateStats(tokenId, 5000);
+    assert.equal(aggregate.tradeCount, 4);
+    assert.equal(aggregate.cumulativePaidSats, "950");
+    assert.equal(aggregate.recent144TradeCount, 1);
+    assert.equal(aggregate.recent144VolumeSats, "50");
+    assert.equal(aggregate.recent1008TradeCount, 2);
+    assert.equal(aggregate.recent1008VolumeSats, "450");
+    assert.equal(aggregate.recent4320TradeCount, 3);
+    assert.equal(aggregate.recent4320VolumeSats, "750");
     assert.equal(aggregate.lastTradeOfferTxid, "offer-new");
-    assert.equal(aggregate.lastTradeBlockHeight, 1000);
+    assert.equal(aggregate.lastTradeBlockHeight, 5000);
 
     db.replaceTokenStats({
       tokenId,
-      tradeCount: 4,
+      tradeCount: 5,
       cumulativePaidSats: "999",
       lastTradeOfferTxid: "offer-new",
       lastTradeOfferOutIdx: 0,
-      lastTradeBlockHeight: 1000,
-      lastTradeBlockTimestamp: 10000,
+      lastTradeBlockHeight: 5000,
+      lastTradeBlockTimestamp: 50000,
     });
 
     const afterCompatUpdate = db.getTokenAggregateStats(tokenId);
-    assert.equal(afterCompatUpdate?.tradeCount, 4);
+    assert.equal(afterCompatUpdate?.tradeCount, 5);
     assert.equal(afterCompatUpdate?.cumulativePaidSats, "999");
-    assert.equal(afterCompatUpdate?.recent144TradeCount, 2);
-    assert.equal(afterCompatUpdate?.recent144VolumeSats, "350");
-    assert.equal(afterCompatUpdate?.recent1008TradeCount, 3);
-    assert.equal(afterCompatUpdate?.recent1008VolumeSats, "550");
+    assert.equal(afterCompatUpdate?.recent144TradeCount, 1);
+    assert.equal(afterCompatUpdate?.recent144VolumeSats, "50");
+    assert.equal(afterCompatUpdate?.recent1008TradeCount, 2);
+    assert.equal(afterCompatUpdate?.recent1008VolumeSats, "450");
+    assert.equal(afterCompatUpdate?.recent4320TradeCount, 3);
+    assert.equal(afterCompatUpdate?.recent4320VolumeSats, "750");
   } finally {
     db.close();
   }
@@ -283,11 +296,13 @@ test("listTokenStatsPage and listTradeHistory return paginated rows", () => {
     const readyOnly = db.listTokenStatsPage({
       limit: 10,
       readyOnly: true,
-      sortBy: "recent_144_volume_sats",
+      sortBy: "recent_4320_volume_sats",
       order: "desc",
     });
     assert.equal(readyOnly.length, 1);
     assert.equal(readyOnly[0]?.tokenId, "token-a");
+    assert.equal(readyOnly[0]?.recent4320TradeCount, 1);
+    assert.equal(readyOnly[0]?.recent4320VolumeSats, "400");
 
     const tokenTrades = db.listTradeHistory({
       tokenId: "token-a",

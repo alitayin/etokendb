@@ -14,6 +14,8 @@ export type TokenSortField =
   | "recent144VolumeSats"
   | "recent1008TradeCount"
   | "recent1008VolumeSats"
+  | "recent4320TradeCount"
+  | "recent4320VolumeSats"
   | "lastTradeBlockHeight"
   | "lastTradeBlockTimestamp";
 
@@ -68,6 +70,8 @@ export interface TokenSummary {
   recent144VolumeSats: string;
   recent1008TradeCount: number;
   recent1008VolumeSats: string;
+  recent4320TradeCount: number;
+  recent4320VolumeSats: string;
   lastTradeBlockHeight: number | null;
   lastTradeBlockTimestamp: number | null;
   lastSyncedAt: number | null;

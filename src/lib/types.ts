@@ -8,6 +8,8 @@ export type TokenStatsSortField =
   | "recent_144_volume_sats"
   | "recent_1008_trade_count"
   | "recent_1008_volume_sats"
+  | "recent_4320_trade_count"
+  | "recent_4320_volume_sats"
   | "last_trade_block_height"
   | "last_trade_block_timestamp";
 
@@ -64,6 +66,8 @@ export interface TokenAggregateStatsRecord extends TokenStatsRecord {
   recent144VolumeSats: string;
   recent1008TradeCount: number;
   recent1008VolumeSats: string;
+  recent4320TradeCount: number;
+  recent4320VolumeSats: string;
   updatedAt: number;
 }
 
@@ -109,6 +113,8 @@ export interface TokenRollingStatsSnapshot {
   recent144VolumeSats: string;
   recent1008TradeCount: number;
   recent1008VolumeSats: string;
+  recent4320TradeCount: number;
+  recent4320VolumeSats: string;
 }
 
 export interface TradeHistoryRow extends ProcessedTradeRecord {
