@@ -1,0 +1,37 @@
+{
+  "name": "etokendb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/cli/server.ts",
+    "server": "tsx src/cli/server.ts",
+    "start:skip-zero": "tsx src/cli/server.ts --skip-known-zero-trade-bootstrap",
+    "server:skip-zero": "tsx src/cli/server.ts --skip-known-zero-trade-bootstrap",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "probe:agora": "tsx src/probes/agoraProbe.ts",
+    "probe:agora-page": "tsx src/probes/agoraPageProbe.ts",
+    "sync:discover-active": "tsx src/cli/agoraSync.ts discover-active",
+    "sync:backfill-token": "tsx src/cli/agoraSync.ts backfill-token",
+    "sync:active-once": "tsx src/cli/agoraSync.ts sync-active-once",
+    "sync:tail-active": "tsx src/cli/agoraSync.ts tail-active",
+    "report:status": "tsx src/cli/report.ts status",
+    "report:tokens": "tsx src/cli/report.ts tokens",
+    "report:token": "tsx src/cli/report.ts token"
+  },
+  "dependencies": {
+    "@types/node": "^25.6.0",
+    "better-sqlite3": "^12.9.0",
+    "chronik-client": "^4.1.0",
+    "dotenv": "^17.4.2",
+    "ecash-agora": "^4.0.2",
+    "pino": "^10.3.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13"
+  }
+}
