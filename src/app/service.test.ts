@@ -328,7 +328,7 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
         warn: () => {},
         error: () => {},
       },
-      skipKnownZeroTradeBootstrap: true,
+      deferKnownTradeCountLte: 0,
       ops: {
         discoverActiveTokens: async () => [
           {
@@ -372,6 +372,104 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
     assert.equal(service.getStatus().bootstrapTokenCount, 1);
     assert.equal(db.getTrackedToken("token-zero")?.bootstrapCohort, false);
     assert.ok(seen.includes("token-zero:full"));
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("service can defer known low-trade tokens by configurable threshold", async () => {
+  const db = openDatabase(":memory:");
+  db.upsertTrackedToken({
+    tokenId: "token-one",
+    groupHex: "46token-one",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.insertProcessedTrades([
+    {
+      tokenId: "token-one",
+      offerTxid: "offer-1",
+      offerOutIdx: 0,
+      spendTxid: "spend-1",
+      variantType: "PARTIAL",
+      paidSats: "100",
+      soldAtoms: "10",
+      priceNanosatsPerAtom: "10000000",
+      takerScriptHex: null,
+      blockHeight: 900_000,
+      blockHash: "block-900000",
+      blockTimestamp: 1_700_000_000,
+      rawTradeJson: "{}",
+    },
+  ]);
+  db.markTokenReady("token-one", true, 1000);
+  db.markTokenSynced("token-one", 1000);
+  db.recomputeTokenAggregateStats("token-one", 900_000);
+
+  const seen: string[] = [];
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 900_000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+      deferKnownTradeCountLte: 1,
+      ops: {
+        discoverActiveTokens: async () => [
+          {
+            tokenId: "token-one",
+            groupHex: "46token-one",
+            groupPrefixHex: "46",
+            kind: "FUNGIBLE",
+          },
+        ],
+        syncTokenHistory: async (_db, _deps, _config, tokenId, mode) => {
+          seen.push(`${tokenId}:${mode}`);
+          return {
+            tokenId,
+            pageCount: 1,
+            scannedTradeCount: 0,
+            insertedTradeCount: 0,
+          };
+        },
+      },
+    },
+  );
+
+  try {
+    await service.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(service.getStatus().bootstrapTokenCount, 0);
+    assert.ok(seen.includes("token-one:full"));
   } finally {
     service.stop();
     db.close();

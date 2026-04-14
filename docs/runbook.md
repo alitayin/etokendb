@@ -61,6 +61,12 @@ If you want faster startup by deferring previously-synced zero-trade tokens out 
 npm run start:skip-zero
 ```
 
+If you want a custom threshold, pass it on the CLI:
+
+```bash
+npm start -- --defer-known-trade-count-lte=1
+```
+
 ### Start under PM2
 
 ```bash
@@ -79,7 +85,7 @@ npm install
 pm2 restart etokendb
 ```
 
-If you deployed with zero-trade bootstrap deferral:
+If you deployed with trade-count bootstrap deferral:
 
 ```bash
 git pull
@@ -112,7 +118,9 @@ Notes:
 - If websocket is unavailable, the service falls back to polling mode and still completes bootstrap.
 - Every 60 seconds the service rediscovers newly active fungible tokens.
 - Optional startup mode:
-  `--skip-known-zero-trade-bootstrap` keeps previously-ready zero-trade tokens out of blocking bootstrap, then syncs them in the background after the API becomes available.
+  `--skip-known-zero-trade-bootstrap` is a convenience alias for `--defer-known-trade-count-lte=0`.
+- General startup mode:
+  `--defer-known-trade-count-lte=N` keeps previously-ready tokens with `tradeCount <= N` out of blocking bootstrap, then syncs them in the background after the API becomes available.
 
 ## 4. API port and endpoints
 
@@ -154,6 +162,7 @@ Useful startup commands:
 ```bash
 npm start
 npm run start:skip-zero
+npm start -- --defer-known-trade-count-lte=1
 ```
 
 ## 4.1 Nginx reverse proxy

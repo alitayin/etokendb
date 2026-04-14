@@ -8,6 +8,8 @@
     "server": "tsx src/cli/server.ts",
     "start:skip-zero": "tsx src/cli/server.ts --skip-known-zero-trade-bootstrap",
     "server:skip-zero": "tsx src/cli/server.ts --skip-known-zero-trade-bootstrap",
+    "start:skip-lte1": "tsx src/cli/server.ts --defer-known-trade-count-lte=1",
+    "server:skip-lte1": "tsx src/cli/server.ts --defer-known-trade-count-lte=1",
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test src/**/*.test.ts",

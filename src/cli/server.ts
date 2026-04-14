@@ -11,10 +11,12 @@ async function main(): Promise<void> {
   const db = openDatabase(config.sqlitePath);
   const deps = createSyncDependencies(config);
   const service = new AgoraTokenService(db, deps, config, {
-    skipKnownZeroTradeBootstrap: cliOptions.skipKnownZeroTradeBootstrap,
+    deferKnownTradeCountLte: cliOptions.deferKnownTradeCountLte,
   });
-  if (cliOptions.skipKnownZeroTradeBootstrap) {
-    console.log("server option enabled | skip_known_zero_trade_bootstrap=yes");
+  if (cliOptions.deferKnownTradeCountLte !== null) {
+    console.log(
+      `server option enabled | defer_known_trade_count_lte=${cliOptions.deferKnownTradeCountLte}`,
+    );
   }
   const runtime = await startApplication(service, config);
 
