@@ -134,6 +134,8 @@ function tokenSortSql(sort: TokenSortField, order: "asc" | "desc"): string {
       return `${numericInt("s.trade_count")} ${direction}, t.token_id ASC`;
     case "totalVolumeSats":
       return `${numericText("s.cumulative_paid_sats")} ${direction}, t.token_id ASC`;
+    case "latestPriceNanosatsPerAtom":
+      return `${numericText("s.last_trade_price_nanosats_per_atom")} ${direction}, t.token_id ASC`;
     case "recent144TradeCount":
       return `${numericInt("s.recent_144_trade_count")} ${direction}, t.token_id ASC`;
     case "recent144VolumeSats":
@@ -155,6 +157,15 @@ function tokenSortSql(sort: TokenSortField, order: "asc" | "desc"): string {
   }
 }
 
+function formatPriceChangePct(bpsRaw: string | null | undefined): string {
+  const bps = BigInt(bpsRaw ?? "0");
+  const negative = bps < 0n;
+  const absolute = negative ? -bps : bps;
+  const whole = absolute / 100n;
+  const fraction = (absolute % 100n).toString().padStart(2, "0");
+  return `${negative ? "-" : ""}${whole.toString()}.${fraction}`;
+}
+
 function toTokenSummary(row: Record<string, unknown>): TokenSummary {
   return {
     tokenId: row.token_id as string,
@@ -163,8 +174,17 @@ function toTokenSummary(row: Record<string, unknown>): TokenSummary {
     bootstrapCohort: Number(row.bootstrap_cohort ?? 0) === 1,
     totalTradeCount: Number(row.trade_count ?? 0),
     totalVolumeSats: String(row.cumulative_paid_sats ?? "0"),
+    latestPriceNanosatsPerAtom:
+      row.last_trade_price_nanosats_per_atom === null ||
+      row.last_trade_price_nanosats_per_atom === undefined
+        ? null
+        : String(row.last_trade_price_nanosats_per_atom),
     recent144TradeCount: Number(row.recent_144_trade_count ?? 0),
     recent144VolumeSats: String(row.recent_144_volume_sats ?? "0"),
+    recent144PriceChangeBps: String(row.recent_144_price_change_bps ?? "0"),
+    recent144PriceChangePct: formatPriceChangePct(
+      row.recent_144_price_change_bps as string | null | undefined,
+    ),
     recent1008TradeCount: Number(row.recent_1008_trade_count ?? 0),
     recent1008VolumeSats: String(row.recent_1008_volume_sats ?? "0"),
     recent4320TradeCount: Number(row.recent_4320_trade_count ?? 0),
@@ -374,8 +394,10 @@ export class AgoraTokenService implements ServiceReadApi {
             t.last_ws_event_at,
             s.trade_count,
             s.cumulative_paid_sats,
+            s.last_trade_price_nanosats_per_atom,
             s.recent_144_trade_count,
             s.recent_144_volume_sats,
+            s.recent_144_price_change_bps,
             s.recent_1008_trade_count,
             s.recent_1008_volume_sats,
             s.recent_4320_trade_count,
@@ -417,8 +439,10 @@ export class AgoraTokenService implements ServiceReadApi {
             t.last_ws_event_at,
             s.trade_count,
             s.cumulative_paid_sats,
+            s.last_trade_price_nanosats_per_atom,
             s.recent_144_trade_count,
             s.recent_144_volume_sats,
+            s.recent_144_price_change_bps,
             s.recent_1008_trade_count,
             s.recent_1008_volume_sats,
             s.recent_4320_trade_count,

@@ -10,6 +10,7 @@ export type BootstrapPhase =
 export type TokenSortField =
   | "totalTradeCount"
   | "totalVolumeSats"
+  | "latestPriceNanosatsPerAtom"
   | "recent144TradeCount"
   | "recent144VolumeSats"
   | "recent1008TradeCount"
@@ -66,8 +67,11 @@ export interface TokenSummary {
   bootstrapCohort: boolean;
   totalTradeCount: number;
   totalVolumeSats: string;
+  latestPriceNanosatsPerAtom: string | null;
   recent144TradeCount: number;
   recent144VolumeSats: string;
+  recent144PriceChangeBps: string;
+  recent144PriceChangePct: string;
   recent1008TradeCount: number;
   recent1008VolumeSats: string;
   recent4320TradeCount: number;

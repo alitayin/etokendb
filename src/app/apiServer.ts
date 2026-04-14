@@ -63,6 +63,7 @@ const DEFAULT_ORDER: "asc" | "desc" = "desc";
 const TOKEN_SORT_FIELDS = new Set<TokenSortField>([
   "totalTradeCount",
   "totalVolumeSats",
+  "latestPriceNanosatsPerAtom",
   "recent144TradeCount",
   "recent144VolumeSats",
   "recent1008TradeCount",

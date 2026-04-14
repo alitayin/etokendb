@@ -161,6 +161,7 @@ function createSchema(sqlite: Database.Database): void {
       cumulative_paid_sats TEXT NOT NULL,
       recent_144_trade_count INTEGER NOT NULL DEFAULT 0,
       recent_144_volume_sats TEXT NOT NULL DEFAULT '0',
+      recent_144_price_change_bps TEXT NOT NULL DEFAULT '0',
       recent_1008_trade_count INTEGER NOT NULL DEFAULT 0,
       recent_1008_volume_sats TEXT NOT NULL DEFAULT '0',
       recent_4320_trade_count INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +170,7 @@ function createSchema(sqlite: Database.Database): void {
       last_trade_offer_out_idx INTEGER,
       last_trade_block_height INTEGER,
       last_trade_block_timestamp INTEGER,
+      last_trade_price_nanosats_per_atom TEXT,
       updated_at INTEGER NOT NULL
     );
   `);
@@ -205,6 +207,12 @@ function createSchema(sqlite: Database.Database): void {
   ensureColumn(
     sqlite,
     "token_stats",
+    "recent_144_price_change_bps",
+    "TEXT NOT NULL DEFAULT '0'",
+  );
+  ensureColumn(
+    sqlite,
+    "token_stats",
     "recent_1008_trade_count",
     "INTEGER NOT NULL DEFAULT 0",
   );
@@ -225,6 +233,12 @@ function createSchema(sqlite: Database.Database): void {
     "token_stats",
     "recent_4320_volume_sats",
     "TEXT NOT NULL DEFAULT '0'",
+  );
+  ensureColumn(
+    sqlite,
+    "token_stats",
+    "last_trade_price_nanosats_per_atom",
+    "TEXT",
   );
 }
 
@@ -274,6 +288,8 @@ function toTokenStatsRecord(row: Record<string, unknown>): TokenStatsRecord {
       (row.last_trade_block_height as number | null) ?? null,
     lastTradeBlockTimestamp:
       (row.last_trade_block_timestamp as number | null) ?? null,
+    lastTradePriceNanosatsPerAtom:
+      (row.last_trade_price_nanosats_per_atom as string | null) ?? null,
   };
 }
 
@@ -284,6 +300,7 @@ function toTokenAggregateStatsRecord(
     ...toTokenStatsRecord(row),
     recent144TradeCount: row.recent_144_trade_count as number,
     recent144VolumeSats: row.recent_144_volume_sats as string,
+    recent144PriceChangeBps: row.recent_144_price_change_bps as string,
     recent1008TradeCount: row.recent_1008_trade_count as number,
     recent1008VolumeSats: row.recent_1008_volume_sats as string,
     recent4320TradeCount: row.recent_4320_trade_count as number,
@@ -334,6 +351,8 @@ function buildStatsOrderByClause(
       return `s.trade_count ${direction}, s.token_id ASC`;
     case "cumulative_paid_sats":
       return `LENGTH(s.cumulative_paid_sats) ${direction}, s.cumulative_paid_sats ${direction}, s.token_id ASC`;
+    case "last_trade_price_nanosats_per_atom":
+      return `LENGTH(COALESCE(s.last_trade_price_nanosats_per_atom, '0')) ${direction}, COALESCE(s.last_trade_price_nanosats_per_atom, '0') ${direction}, s.token_id ASC`;
     case "recent_144_trade_count":
       return `s.recent_144_trade_count ${direction}, s.token_id ASC`;
     case "recent_144_volume_sats":
@@ -353,6 +372,23 @@ function buildStatsOrderByClause(
     default:
       return `LENGTH(s.cumulative_paid_sats) DESC, s.cumulative_paid_sats DESC, s.trade_count DESC, s.token_id ASC`;
   }
+}
+
+function computePriceChangeBps(
+  earliestPriceRaw: string | null | undefined,
+  latestPriceRaw: string | null | undefined,
+): string {
+  if (!earliestPriceRaw || !latestPriceRaw) {
+    return "0";
+  }
+
+  const earliestPrice = BigInt(earliestPriceRaw);
+  const latestPrice = BigInt(latestPriceRaw);
+  if (earliestPrice <= 0n) {
+    return "0";
+  }
+
+  return (((latestPrice - earliestPrice) * 10_000n) / earliestPrice).toString();
 }
 
 function upsertBlockBucket(
@@ -672,7 +708,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_txid,
       last_trade_offer_out_idx,
       last_trade_block_height,
-      last_trade_block_timestamp
+      last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom
     FROM token_stats
     WHERE token_id = ?
   `);
@@ -684,6 +721,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       cumulative_paid_sats,
       recent_144_trade_count,
       recent_144_volume_sats,
+      recent_144_price_change_bps,
       recent_1008_trade_count,
       recent_1008_volume_sats,
       recent_4320_trade_count,
@@ -692,6 +730,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_out_idx,
       last_trade_block_height,
       last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom,
       updated_at
     FROM token_stats
     WHERE token_id = ?
@@ -704,6 +743,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       cumulative_paid_sats,
       recent_144_trade_count,
       recent_144_volume_sats,
+      recent_144_price_change_bps,
       recent_1008_trade_count,
       recent_1008_volume_sats,
       recent_4320_trade_count,
@@ -712,6 +752,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_out_idx,
       last_trade_block_height,
       last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom,
       updated_at
     ) VALUES (
       @tokenId,
@@ -719,6 +760,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @cumulativePaidSats,
       @recent144TradeCount,
       @recent144VolumeSats,
+      @recent144PriceChangeBps,
       @recent1008TradeCount,
       @recent1008VolumeSats,
       @recent4320TradeCount,
@@ -727,6 +769,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @lastTradeOfferOutIdx,
       @lastTradeBlockHeight,
       @lastTradeBlockTimestamp,
+      @lastTradePriceNanosatsPerAtom,
       @updatedAt
     )
     ON CONFLICT(token_id) DO UPDATE SET
@@ -736,6 +779,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_out_idx = excluded.last_trade_offer_out_idx,
       last_trade_block_height = excluded.last_trade_block_height,
       last_trade_block_timestamp = excluded.last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom = excluded.last_trade_price_nanosats_per_atom,
       updated_at = excluded.updated_at
   `);
 
@@ -746,6 +790,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       cumulative_paid_sats,
       recent_144_trade_count,
       recent_144_volume_sats,
+      recent_144_price_change_bps,
       recent_1008_trade_count,
       recent_1008_volume_sats,
       recent_4320_trade_count,
@@ -754,6 +799,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_out_idx,
       last_trade_block_height,
       last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom,
       updated_at
     ) VALUES (
       @tokenId,
@@ -761,6 +807,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @cumulativePaidSats,
       @recent144TradeCount,
       @recent144VolumeSats,
+      @recent144PriceChangeBps,
       @recent1008TradeCount,
       @recent1008VolumeSats,
       @recent4320TradeCount,
@@ -769,6 +816,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @lastTradeOfferOutIdx,
       @lastTradeBlockHeight,
       @lastTradeBlockTimestamp,
+      @lastTradePriceNanosatsPerAtom,
       @updatedAt
     )
     ON CONFLICT(token_id) DO UPDATE SET
@@ -776,6 +824,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       cumulative_paid_sats = excluded.cumulative_paid_sats,
       recent_144_trade_count = excluded.recent_144_trade_count,
       recent_144_volume_sats = excluded.recent_144_volume_sats,
+      recent_144_price_change_bps = excluded.recent_144_price_change_bps,
       recent_1008_trade_count = excluded.recent_1008_trade_count,
       recent_1008_volume_sats = excluded.recent_1008_volume_sats,
       recent_4320_trade_count = excluded.recent_4320_trade_count,
@@ -784,6 +833,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       last_trade_offer_out_idx = excluded.last_trade_offer_out_idx,
       last_trade_block_height = excluded.last_trade_block_height,
       last_trade_block_timestamp = excluded.last_trade_block_timestamp,
+      last_trade_price_nanosats_per_atom = excluded.last_trade_price_nanosats_per_atom,
       updated_at = excluded.updated_at
   `);
 
@@ -801,12 +851,49 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       offer_txid,
       offer_out_idx,
       block_height,
-      block_timestamp
+      block_timestamp,
+      price_nanosats_per_atom,
+      inserted_at
     FROM processed_trades
     WHERE token_id = ?
     ORDER BY
       block_height DESC NULLS LAST,
       block_timestamp DESC NULLS LAST,
+      inserted_at DESC,
+      offer_txid DESC,
+      offer_out_idx DESC
+    LIMIT 1
+  `);
+
+  const getEarliestRecent144TradeByTokenStmt = sqlite.prepare(`
+    SELECT
+      offer_txid,
+      offer_out_idx,
+      price_nanosats_per_atom
+    FROM processed_trades
+    WHERE token_id = ?
+      AND block_height >= ?
+    ORDER BY
+      block_height ASC,
+      block_timestamp ASC,
+      inserted_at ASC,
+      offer_txid ASC,
+      offer_out_idx ASC
+    LIMIT 1
+  `);
+
+  const getLatestRecent144TradeByTokenStmt = sqlite.prepare(`
+    SELECT
+      offer_txid,
+      offer_out_idx,
+      price_nanosats_per_atom
+    FROM processed_trades
+    WHERE token_id = ?
+      AND block_height >= ?
+    ORDER BY
+      block_height DESC,
+      block_timestamp DESC,
+      inserted_at DESC,
       offer_txid DESC,
       offer_out_idx DESC
     LIMIT 1
@@ -983,6 +1070,24 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       const latestTrade = getLatestTradeByTokenStmt.get(tokenId) as
         | Record<string, unknown>
         | undefined;
+      const minRecent144Height = chainTipHeight - 143;
+      const earliestRecent144Trade = getEarliestRecent144TradeByTokenStmt.get(
+        tokenId,
+        minRecent144Height,
+      ) as Record<string, unknown> | undefined;
+      const latestRecent144Trade = getLatestRecent144TradeByTokenStmt.get(
+        tokenId,
+        minRecent144Height,
+      ) as Record<string, unknown> | undefined;
+      const hasDistinctRecent144Trades =
+        earliestRecent144Trade !== undefined &&
+        latestRecent144Trade !== undefined &&
+        (
+          (earliestRecent144Trade.offer_txid as string) !==
+            (latestRecent144Trade.offer_txid as string) ||
+          (earliestRecent144Trade.offer_out_idx as number) !==
+            (latestRecent144Trade.offer_out_idx as number)
+        );
       const now = Date.now();
 
       const aggregate: TokenAggregateStatsRecord = {
@@ -991,6 +1096,12 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         cumulativePaidSats: snapshot.totalVolumeSats,
         recent144TradeCount: snapshot.recent144TradeCount,
         recent144VolumeSats: snapshot.recent144VolumeSats,
+        recent144PriceChangeBps: hasDistinctRecent144Trades
+          ? computePriceChangeBps(
+              earliestRecent144Trade.price_nanosats_per_atom as string | null | undefined,
+              latestRecent144Trade?.price_nanosats_per_atom as string | null | undefined,
+            )
+          : "0",
         recent1008TradeCount: snapshot.recent1008TradeCount,
         recent1008VolumeSats: snapshot.recent1008VolumeSats,
         recent4320TradeCount: snapshot.recent4320TradeCount,
@@ -1002,6 +1113,8 @@ export function openDatabase(sqlitePath: string): AppDatabase {
           (latestTrade?.block_height as number | null) ?? null,
         lastTradeBlockTimestamp:
           (latestTrade?.block_timestamp as number | null) ?? null,
+        lastTradePriceNanosatsPerAtom:
+          (latestTrade?.price_nanosats_per_atom as string | null) ?? null,
         updatedAt: now,
       };
 
@@ -1011,6 +1124,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         cumulativePaidSats: aggregate.cumulativePaidSats,
         recent144TradeCount: aggregate.recent144TradeCount,
         recent144VolumeSats: aggregate.recent144VolumeSats,
+        recent144PriceChangeBps: aggregate.recent144PriceChangeBps,
         recent1008TradeCount: aggregate.recent1008TradeCount,
         recent1008VolumeSats: aggregate.recent1008VolumeSats,
         recent4320TradeCount: aggregate.recent4320TradeCount,
@@ -1019,6 +1133,7 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         lastTradeOfferOutIdx: aggregate.lastTradeOfferOutIdx,
         lastTradeBlockHeight: aggregate.lastTradeBlockHeight,
         lastTradeBlockTimestamp: aggregate.lastTradeBlockTimestamp,
+        lastTradePriceNanosatsPerAtom: aggregate.lastTradePriceNanosatsPerAtom,
         updatedAt: aggregate.updatedAt,
       });
 
@@ -1063,10 +1178,12 @@ export function openDatabase(sqlitePath: string): AppDatabase {
         ...stats,
         recent144TradeCount: 0,
         recent144VolumeSats: "0",
+        recent144PriceChangeBps: "0",
         recent1008TradeCount: 0,
         recent1008VolumeSats: "0",
         recent4320TradeCount: 0,
         recent4320VolumeSats: "0",
+        lastTradePriceNanosatsPerAtom: stats.lastTradePriceNanosatsPerAtom,
         updatedAt: Date.now(),
       });
     },
@@ -1150,8 +1267,10 @@ export function openDatabase(sqlitePath: string): AppDatabase {
           s.token_id,
           s.trade_count,
           s.cumulative_paid_sats,
+          s.last_trade_price_nanosats_per_atom,
           s.recent_144_trade_count,
           s.recent_144_volume_sats,
+          s.recent_144_price_change_bps,
           s.recent_1008_trade_count,
           s.recent_1008_volume_sats,
           s.recent_4320_trade_count,

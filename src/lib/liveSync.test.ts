@@ -161,6 +161,7 @@ test("live sync only marks subscribed fungible token ids dirty", async () => {
       lastTradeOfferOutIdx: 2,
       lastTradeBlockHeight: 101,
       lastTradeBlockTimestamp: 1001,
+      lastTradePriceNanosatsPerAtom: "10000000000",
     });
   } finally {
     live.stop();

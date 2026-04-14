@@ -512,7 +512,7 @@ test("service can defer known low-trade tokens by configurable threshold", async
   }
 });
 
-test("service exposes 30 day rolling stats in token list and detail views", () => {
+test("service exposes latest price and rolling stats in token list and detail views", () => {
   const db = openDatabase(":memory:");
 
   db.upsertTrackedToken({
@@ -550,10 +550,19 @@ test("service exposes 30 day rolling stats in token list and detail views", () =
     }),
     makeProcessedTrade({
       tokenId: "token-30d",
+      offerTxid: "offer-24h-early",
+      outIdx: 0,
+      spendTxid: "spend-24h-early",
+      paidSats: "100",
+      blockHeight: 4900,
+      blockTimestamp: 49_000,
+    }),
+    makeProcessedTrade({
+      tokenId: "token-30d",
       offerTxid: "offer-new",
       outIdx: 0,
       spendTxid: "spend-new",
-      paidSats: "50",
+      paidSats: "150",
       blockHeight: 5000,
       blockTimestamp: 50_000,
     }),
@@ -614,12 +623,23 @@ test("service exposes 30 day rolling stats in token list and detail views", () =
       readyOnly: true,
     });
     assert.equal(page.items[0]?.tokenId, "token-30d");
-    assert.equal(page.items[0]?.recent4320TradeCount, 3);
-    assert.equal(page.items[0]?.recent4320VolumeSats, "750");
+    assert.equal(page.items[0]?.recent4320TradeCount, 4);
+    assert.equal(page.items[0]?.recent4320VolumeSats, "950");
+    assert.equal(page.items[0]?.latestPriceNanosatsPerAtom, "150");
+    assert.equal(page.items[0]?.recent144PriceChangeBps, "5000");
+    assert.equal(page.items[0]?.recent144PriceChangePct, "50.00");
 
     const detail = service.getToken("token-30d");
-    assert.equal(detail?.summary.recent4320TradeCount, 3);
-    assert.equal(detail?.summary.recent4320VolumeSats, "750");
+    assert.equal(detail?.summary.recent4320TradeCount, 4);
+    assert.equal(detail?.summary.recent4320VolumeSats, "950");
+    assert.equal(detail?.summary.latestPriceNanosatsPerAtom, "150");
+    assert.equal(detail?.summary.recent144PriceChangeBps, "5000");
+    assert.equal(detail?.summary.recent144PriceChangePct, "50.00");
+
+    const singleTradeToken = service.getToken("token-small");
+    assert.equal(singleTradeToken?.summary.latestPriceNanosatsPerAtom, "100");
+    assert.equal(singleTradeToken?.summary.recent144PriceChangeBps, "0");
+    assert.equal(singleTradeToken?.summary.recent144PriceChangePct, "0.00");
   } finally {
     service.stop();
     db.close();

@@ -225,12 +225,14 @@ test("recomputeTokenAggregateStats builds total + 144/1008/4320 windows and keep
     assert.equal(aggregate.cumulativePaidSats, "950");
     assert.equal(aggregate.recent144TradeCount, 1);
     assert.equal(aggregate.recent144VolumeSats, "50");
+    assert.equal(aggregate.recent144PriceChangeBps, "0");
     assert.equal(aggregate.recent1008TradeCount, 2);
     assert.equal(aggregate.recent1008VolumeSats, "450");
     assert.equal(aggregate.recent4320TradeCount, 3);
     assert.equal(aggregate.recent4320VolumeSats, "750");
     assert.equal(aggregate.lastTradeOfferTxid, "offer-new");
     assert.equal(aggregate.lastTradeBlockHeight, 5000);
+    assert.equal(aggregate.lastTradePriceNanosatsPerAtom, "50");
 
     db.replaceTokenStats({
       tokenId,
@@ -240,6 +242,7 @@ test("recomputeTokenAggregateStats builds total + 144/1008/4320 windows and keep
       lastTradeOfferOutIdx: 0,
       lastTradeBlockHeight: 5000,
       lastTradeBlockTimestamp: 50000,
+      lastTradePriceNanosatsPerAtom: "50",
     });
 
     const afterCompatUpdate = db.getTokenAggregateStats(tokenId);
@@ -247,10 +250,67 @@ test("recomputeTokenAggregateStats builds total + 144/1008/4320 windows and keep
     assert.equal(afterCompatUpdate?.cumulativePaidSats, "999");
     assert.equal(afterCompatUpdate?.recent144TradeCount, 1);
     assert.equal(afterCompatUpdate?.recent144VolumeSats, "50");
+    assert.equal(afterCompatUpdate?.recent144PriceChangeBps, "0");
     assert.equal(afterCompatUpdate?.recent1008TradeCount, 2);
     assert.equal(afterCompatUpdate?.recent1008VolumeSats, "450");
     assert.equal(afterCompatUpdate?.recent4320TradeCount, 3);
     assert.equal(afterCompatUpdate?.recent4320VolumeSats, "750");
+    assert.equal(afterCompatUpdate?.lastTradePriceNanosatsPerAtom, "50");
+  } finally {
+    db.close();
+  }
+});
+
+test("recomputeTokenAggregateStats computes recent 144 block price change only when there are at least two window trades", () => {
+  const db = openDatabase(":memory:");
+
+  try {
+    const tokenId = "token-price-change";
+    db.insertProcessedTrades([
+      makeTrade({
+        tokenId,
+        offerTxid: "offer-old",
+        outIdx: 0,
+        spendTxid: "spend-old",
+        paidSats: "20",
+        soldAtoms: "1",
+        blockHeight: 4700,
+        blockTimestamp: 47_000,
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "offer-early-window",
+        outIdx: 0,
+        spendTxid: "spend-early-window",
+        paidSats: "100",
+        soldAtoms: "1",
+        blockHeight: 4900,
+        blockTimestamp: 49_000,
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "offer-late-window",
+        outIdx: 0,
+        spendTxid: "spend-late-window",
+        paidSats: "150",
+        soldAtoms: "1",
+        blockHeight: 5000,
+        blockTimestamp: 50_000,
+      }),
+    ]);
+
+    const aggregate = db.recomputeTokenAggregateStats(tokenId, 5000);
+    assert.equal(aggregate.recent144TradeCount, 2);
+    assert.equal(aggregate.lastTradePriceNanosatsPerAtom, "150");
+    assert.equal(aggregate.recent144PriceChangeBps, "5000");
+
+    const statsPage = db.listTokenStatsPage({
+      limit: 5,
+      sortBy: "last_trade_price_nanosats_per_atom",
+      order: "desc",
+    });
+    assert.equal(statsPage[0]?.tokenId, tokenId);
+    assert.equal(statsPage[0]?.recent144PriceChangeBps, "5000");
   } finally {
     db.close();
   }
@@ -393,14 +453,20 @@ test("openDatabase migrates legacy token_stats rows to include 30 day rolling co
     const columns = db.sqlite
       .prepare(`PRAGMA table_info(token_stats)`)
       .all() as Array<{ name: string }>;
+    assert.ok(columns.some((column) => column.name === "recent_144_price_change_bps"));
     assert.ok(columns.some((column) => column.name === "recent_4320_trade_count"));
     assert.ok(columns.some((column) => column.name === "recent_4320_volume_sats"));
+    assert.ok(
+      columns.some((column) => column.name === "last_trade_price_nanosats_per_atom"),
+    );
 
     const aggregate = db.getTokenAggregateStats("legacy-token");
     assert.equal(aggregate?.tradeCount, 3);
     assert.equal(aggregate?.cumulativePaidSats, "999");
+    assert.equal(aggregate?.recent144PriceChangeBps, "0");
     assert.equal(aggregate?.recent4320TradeCount, 0);
     assert.equal(aggregate?.recent4320VolumeSats, "0");
+    assert.equal(aggregate?.lastTradePriceNanosatsPerAtom, null);
   } finally {
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });

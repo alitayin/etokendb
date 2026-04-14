@@ -4,6 +4,7 @@ export type TokenInitStatus = "PENDING" | "INITIALIZING" | "READY" | "ERROR";
 export type TokenStatsSortField =
   | "trade_count"
   | "cumulative_paid_sats"
+  | "last_trade_price_nanosats_per_atom"
   | "recent_144_trade_count"
   | "recent_144_volume_sats"
   | "recent_1008_trade_count"
@@ -59,11 +60,13 @@ export interface TokenStatsRecord {
   lastTradeOfferOutIdx: number | null;
   lastTradeBlockHeight: number | null;
   lastTradeBlockTimestamp: number | null;
+  lastTradePriceNanosatsPerAtom: string | null;
 }
 
 export interface TokenAggregateStatsRecord extends TokenStatsRecord {
   recent144TradeCount: number;
   recent144VolumeSats: string;
+  recent144PriceChangeBps: string;
   recent1008TradeCount: number;
   recent1008VolumeSats: string;
   recent4320TradeCount: number;

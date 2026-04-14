@@ -199,6 +199,7 @@ Supported `sort` values:
 
 - `totalTradeCount`
 - `totalVolumeSats`
+- `latestPriceNanosatsPerAtom`
 - `recent144TradeCount`
 - `recent144VolumeSats`
 - `recent1008TradeCount`
@@ -239,6 +240,12 @@ Top tokens by total traded volume:
 curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=totalVolumeSats&order=desc"
 ```
 
+Top tokens by latest trade price:
+
+```bash
+curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=latestPriceNanosatsPerAtom&order=desc"
+```
+
 Only ready tokens:
 
 ```bash
@@ -247,6 +254,15 @@ curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20&sort=recent1008VolumeS
 
 `1008` blocks is the current "7 day" window in this product.
 `4320` blocks is the current "30 day" window in this product.
+
+Additional token summary fields:
+
+- `latestPriceNanosatsPerAtom`
+- `recent144PriceChangeBps`
+- `recent144PriceChangePct`
+
+`recent144PriceChangePct` compares the earliest confirmed trade price and latest confirmed trade price inside the last 144 blocks.
+If there are fewer than 2 confirmed trades in that 144-block window, it returns `0.00`.
 
 ## 6. Current improvement points and risks
 
@@ -287,6 +303,14 @@ These are review notes only. They do not change current business behavior.
 - Risky if exposed directly to the internet.
 - Improvement direction:
   put it behind nginx/Caddy and add rate limiting or IP controls.
+
+### F. Websocket tx handling does not yet distinguish mempool from confirmed updates
+
+- Chronik websocket tx messages include mempool and confirmed lifecycle events.
+- The current service marks tokens dirty on any matching tx event.
+- Because trade storage only persists confirmed trades, a mempool-triggered tail sync can be a harmless no-op until confirmation arrives.
+- Improvement direction:
+  treat `TX_CONFIRMED` and block-driven catch-up as the real persistence trigger, while using mempool events only as an early hint.
 
 ## 7. Current macro stats
 

@@ -257,11 +257,13 @@ export function applyTradeStatsDelta(
     | "lastTradeOfferOutIdx"
     | "lastTradeBlockHeight"
     | "lastTradeBlockTimestamp"
+    | "lastTradePriceNanosatsPerAtom"
   > = {
     lastTradeOfferTxid: current?.lastTradeOfferTxid ?? null,
     lastTradeOfferOutIdx: current?.lastTradeOfferOutIdx ?? null,
     lastTradeBlockHeight: current?.lastTradeBlockHeight ?? null,
     lastTradeBlockTimestamp: current?.lastTradeBlockTimestamp ?? null,
+    lastTradePriceNanosatsPerAtom: current?.lastTradePriceNanosatsPerAtom ?? null,
   };
 
   for (const trade of insertedTrades) {
@@ -289,6 +291,7 @@ export function applyTradeStatsDelta(
         lastTradeOfferOutIdx: trade.offerOutIdx,
         lastTradeBlockHeight: trade.blockHeight,
         lastTradeBlockTimestamp: trade.blockTimestamp,
+        lastTradePriceNanosatsPerAtom: trade.priceNanosatsPerAtom,
       };
     }
   }
@@ -301,6 +304,7 @@ export function applyTradeStatsDelta(
     lastTradeOfferOutIdx: lastTrade.lastTradeOfferOutIdx,
     lastTradeBlockHeight: lastTrade.lastTradeBlockHeight,
     lastTradeBlockTimestamp: lastTrade.lastTradeBlockTimestamp,
+    lastTradePriceNanosatsPerAtom: lastTrade.lastTradePriceNanosatsPerAtom,
   };
 }
 

@@ -256,6 +256,7 @@ test("syncTokenHistory inserts trades once and accumulates stats once", async ()
       lastTradeOfferOutIdx: 2,
       lastTradeBlockHeight: 102,
       lastTradeBlockTimestamp: 1002,
+      lastTradePriceNanosatsPerAtom: "10000000000",
     });
 
     const second = await syncTokenHistory(db, deps, BASE_CONFIG, tokenId, "tail");
@@ -379,6 +380,7 @@ test("tail sync scans multiple pages so new trades on page 1 are not missed", as
       lastTradeOfferOutIdx: 2,
       lastTradeBlockHeight: 103,
       lastTradeBlockTimestamp: 1003,
+      lastTradePriceNanosatsPerAtom: "10000000000",
     });
   } finally {
     db.close();
