@@ -356,6 +356,7 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
             insertedTradeCount: 0,
           };
         },
+        extractAgoraTokenIdsFromTx: () => ["token-zero"],
       },
     },
   );
@@ -371,7 +372,16 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
 
     assert.equal(service.getStatus().bootstrapTokenCount, 1);
     assert.equal(db.getTrackedToken("token-zero")?.bootstrapCohort, false);
-    assert.ok(seen.includes("token-zero:full"));
+
+    await (service as unknown as { handleWsMessage: (msg: unknown) => Promise<void> })
+      .handleWsMessage({
+        type: "Tx",
+        txid: "spend-zero",
+      });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(!seen.includes("token-zero:full"));
+    assert.ok(seen.includes("token-zero:tail"));
   } finally {
     service.stop();
     db.close();
@@ -469,7 +479,7 @@ test("service can defer known low-trade tokens by configurable threshold", async
     await service.start();
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(service.getStatus().bootstrapTokenCount, 0);
-    assert.ok(seen.includes("token-one:full"));
+    assert.deepEqual(seen, []);
   } finally {
     service.stop();
     db.close();

@@ -48,7 +48,7 @@ interface CoordinatorOps {
 
 interface BootstrapPlan {
   blockingSeeds: ActiveTokenSeed[];
-  deferredTradeThresholdSeeds: ActiveTokenSeed[];
+  skippedTradeThresholdSeeds: ActiveTokenSeed[];
 }
 
 interface ApplyDiscoveryOptions {
@@ -229,7 +229,6 @@ export class AgoraTokenService implements ServiceReadApi {
   private lastTipUpdateAtMs: number | null = null;
   private lastError: string | null = null;
   private bootstrapError: Error | null = null;
-  private deferredBootstrapTokenIds: string[] = [];
   private readonly deferKnownTradeCountLte: number | null;
 
   constructor(
@@ -253,7 +252,6 @@ export class AgoraTokenService implements ServiceReadApi {
     this.ready = false;
     this.phase = "starting";
     this.bootstrapError = null;
-    this.deferredBootstrapTokenIds = [];
 
     try {
       await this.refreshTipHeight();
@@ -265,7 +263,6 @@ export class AgoraTokenService implements ServiceReadApi {
       this.ready = true;
       this.phase = this.wsConnected ? "ready" : "degraded";
       this.startBackgroundLoops();
-      this.enqueueDeferredBootstrapTokens();
     } catch (error) {
       this.phase = "error";
       throw error;
@@ -452,18 +449,17 @@ export class AgoraTokenService implements ServiceReadApi {
     this.phase = "discovering";
     const seeds = await this.discoverTokens("bootstrap");
     const plan = this.buildBootstrapPlan(seeds);
-    this.deferredBootstrapTokenIds = plan.deferredTradeThresholdSeeds.map(
-      (seed) => seed.tokenId,
-    );
     this.bootstrapTokenCount = plan.blockingSeeds.length;
+    if (plan.skippedTradeThresholdSeeds.length > 0) {
+      this.logger.info(
+        `skipping bootstrap tokens by trade-count threshold count=${plan.skippedTradeThresholdSeeds.length} threshold_lte=${this.deferKnownTradeCountLte}`,
+      );
+    }
     this.phase = "subscribing";
     this.applyDiscoverySeeds(seeds, {
       bootstrapTokenIds: new Set(plan.blockingSeeds.map((seed) => seed.tokenId)),
       enqueueTokenIds: new Set(plan.blockingSeeds.map((seed) => seed.tokenId)),
     });
-    for (const seed of plan.deferredTradeThresholdSeeds) {
-      this.db.markTokenInitPending(seed.tokenId, Date.now());
-    }
     if (this.ws) {
       this.subscribeTrackedTokens(seeds.map((seed) => seed.tokenId));
     }
@@ -626,8 +622,12 @@ export class AgoraTokenService implements ServiceReadApi {
 
     for (const seed of seeds) {
       const state = this.ensureTokenState(seed.tokenId);
+      const tracked = this.db.getTrackedToken(seed.tokenId);
       state.active = true;
       state.bootstrapCohort = bootstrapTokenIds.has(seed.tokenId);
+      if (!state.bootstrapCohort && tracked?.isReady) {
+        state.ready = true;
+      }
       const shouldEnqueue =
         enqueueTokenIds === undefined ? !state.ready : enqueueTokenIds.has(seed.tokenId);
       if (shouldEnqueue && !state.ready) {
@@ -663,16 +663,16 @@ export class AgoraTokenService implements ServiceReadApi {
     if (this.deferKnownTradeCountLte === null) {
       return {
         blockingSeeds: seeds,
-        deferredTradeThresholdSeeds: [],
+        skippedTradeThresholdSeeds: [],
       };
     }
 
     const blockingSeeds: ActiveTokenSeed[] = [];
-    const deferredTradeThresholdSeeds: ActiveTokenSeed[] = [];
+    const skippedTradeThresholdSeeds: ActiveTokenSeed[] = [];
 
     for (const seed of seeds) {
       if (this.shouldDeferBootstrap(seed.tokenId)) {
-        deferredTradeThresholdSeeds.push(seed);
+        skippedTradeThresholdSeeds.push(seed);
         continue;
       }
       blockingSeeds.push(seed);
@@ -680,7 +680,7 @@ export class AgoraTokenService implements ServiceReadApi {
 
     return {
       blockingSeeds,
-      deferredTradeThresholdSeeds,
+      skippedTradeThresholdSeeds,
     };
   }
 
@@ -692,20 +692,6 @@ export class AgoraTokenService implements ServiceReadApi {
 
     const aggregate = this.db.getTokenAggregateStats(tokenId);
     return (aggregate?.tradeCount ?? 0) <= (this.deferKnownTradeCountLte as number);
-  }
-
-  private enqueueDeferredBootstrapTokens(): void {
-    if (this.deferredBootstrapTokenIds.length === 0) {
-      return;
-    }
-
-    this.logger.info(
-      `deferring bootstrap tokens by trade-count threshold count=${this.deferredBootstrapTokenIds.length} threshold_lte=${this.deferKnownTradeCountLte}`,
-    );
-    for (const tokenId of this.deferredBootstrapTokenIds) {
-      this.enqueueToken(tokenId);
-    }
-    this.deferredBootstrapTokenIds = [];
   }
 
   private ensureTokenState(tokenId: string): TokenRuntimeState {

@@ -120,7 +120,7 @@ Notes:
 - Optional startup mode:
   `--skip-known-zero-trade-bootstrap` is a convenience alias for `--defer-known-trade-count-lte=0`.
 - General startup mode:
-  `--defer-known-trade-count-lte=N` keeps previously-ready tokens with `tradeCount <= N` out of blocking bootstrap, then syncs them in the background after the API becomes available.
+  `--defer-known-trade-count-lte=N` keeps previously-ready tokens with `tradeCount <= N` out of blocking bootstrap. They remain queryable from existing DB data, and only get tail-synced later when websocket or polling marks them dirty.
 
 ## 4. API port and endpoints
 
