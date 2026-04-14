@@ -5,6 +5,32 @@ import { openDatabase } from "../lib/db.js";
 import type { AppConfig } from "../lib/config.js";
 import { AgoraTokenService } from "./service.js";
 
+function makeProcessedTrade(params: {
+  tokenId: string;
+  offerTxid: string;
+  outIdx: number;
+  spendTxid: string;
+  paidSats: string;
+  blockHeight: number;
+  blockTimestamp: number;
+}) {
+  return {
+    tokenId: params.tokenId,
+    offerTxid: params.offerTxid,
+    offerOutIdx: params.outIdx,
+    spendTxid: params.spendTxid,
+    variantType: "PARTIAL" as const,
+    paidSats: params.paidSats,
+    soldAtoms: "1",
+    priceNanosatsPerAtom: params.paidSats,
+    takerScriptHex: null,
+    blockHeight: params.blockHeight,
+    blockHash: `block-${params.blockHeight}`,
+    blockTimestamp: params.blockTimestamp,
+    rawTradeJson: "{}",
+  };
+}
+
 function requireResolver(value: (() => void) | null): () => void {
   if (value === null) {
     throw new Error("resolver was not assigned");
@@ -480,6 +506,120 @@ test("service can defer known low-trade tokens by configurable threshold", async
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(service.getStatus().bootstrapTokenCount, 0);
     assert.deepEqual(seen, []);
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("service exposes 30 day rolling stats in token list and detail views", () => {
+  const db = openDatabase(":memory:");
+
+  db.upsertTrackedToken({
+    tokenId: "token-30d",
+    groupHex: "46token-30d",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.upsertTrackedToken({
+    tokenId: "token-small",
+    groupHex: "46token-small",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady("token-30d", true, 1000);
+  db.markTokenReady("token-small", true, 1000);
+  db.insertProcessedTrades([
+    makeProcessedTrade({
+      tokenId: "token-30d",
+      offerTxid: "offer-30d",
+      outIdx: 0,
+      spendTxid: "spend-30d",
+      paidSats: "300",
+      blockHeight: 2000,
+      blockTimestamp: 20_000,
+    }),
+    makeProcessedTrade({
+      tokenId: "token-30d",
+      offerTxid: "offer-week",
+      outIdx: 0,
+      spendTxid: "spend-week",
+      paidSats: "400",
+      blockHeight: 4500,
+      blockTimestamp: 45_000,
+    }),
+    makeProcessedTrade({
+      tokenId: "token-30d",
+      offerTxid: "offer-new",
+      outIdx: 0,
+      spendTxid: "spend-new",
+      paidSats: "50",
+      blockHeight: 5000,
+      blockTimestamp: 50_000,
+    }),
+    makeProcessedTrade({
+      tokenId: "token-small",
+      offerTxid: "offer-small",
+      outIdx: 0,
+      spendTxid: "spend-small",
+      paidSats: "100",
+      blockHeight: 5000,
+      blockTimestamp: 50_100,
+    }),
+  ]);
+  db.recomputeAllTokenAggregateStats(5000);
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 5000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+    },
+  );
+
+  try {
+    const page = service.listTokens({
+      page: 1,
+      pageSize: 10,
+      sort: "recent4320VolumeSats",
+      order: "desc",
+      readyOnly: true,
+    });
+    assert.equal(page.items[0]?.tokenId, "token-30d");
+    assert.equal(page.items[0]?.recent4320TradeCount, 3);
+    assert.equal(page.items[0]?.recent4320VolumeSats, "750");
+
+    const detail = service.getToken("token-30d");
+    assert.equal(detail?.summary.recent4320TradeCount, 3);
+    assert.equal(detail?.summary.recent4320VolumeSats, "750");
   } finally {
     service.stop();
     db.close();

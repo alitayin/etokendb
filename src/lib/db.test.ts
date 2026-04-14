@@ -1,5 +1,10 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
+
+import Database from "better-sqlite3";
 
 import { openDatabase } from "./db.js";
 import type { ProcessedTradeRecord } from "./types.js";
@@ -320,5 +325,84 @@ test("listTokenStatsPage and listTradeHistory return paginated rows", () => {
     assert.equal(globalTrades[0]?.offerTxid, "b1");
   } finally {
     db.close();
+  }
+});
+
+test("openDatabase migrates legacy token_stats rows to include 30 day rolling columns", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "etokendb-legacy-"));
+  const sqlitePath = path.join(tempDir, "legacy.sqlite");
+  const legacy = new Database(sqlitePath);
+
+  try {
+    legacy.exec(`
+      CREATE TABLE token_stats (
+        token_id TEXT PRIMARY KEY,
+        trade_count INTEGER NOT NULL,
+        cumulative_paid_sats TEXT NOT NULL,
+        recent_144_trade_count INTEGER NOT NULL DEFAULT 0,
+        recent_144_volume_sats TEXT NOT NULL DEFAULT '0',
+        recent_1008_trade_count INTEGER NOT NULL DEFAULT 0,
+        recent_1008_volume_sats TEXT NOT NULL DEFAULT '0',
+        last_trade_offer_txid TEXT,
+        last_trade_offer_out_idx INTEGER,
+        last_trade_block_height INTEGER,
+        last_trade_block_timestamp INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    legacy
+      .prepare(
+        `
+          INSERT INTO token_stats (
+            token_id,
+            trade_count,
+            cumulative_paid_sats,
+            recent_144_trade_count,
+            recent_144_volume_sats,
+            recent_1008_trade_count,
+            recent_1008_volume_sats,
+            last_trade_offer_txid,
+            last_trade_offer_out_idx,
+            last_trade_block_height,
+            last_trade_block_timestamp,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      )
+      .run(
+        "legacy-token",
+        3,
+        "999",
+        1,
+        "100",
+        2,
+        "300",
+        "offer-legacy",
+        0,
+        123,
+        456,
+        789,
+      );
+  } finally {
+    legacy.close();
+  }
+
+  const db = openDatabase(sqlitePath);
+
+  try {
+    const columns = db.sqlite
+      .prepare(`PRAGMA table_info(token_stats)`)
+      .all() as Array<{ name: string }>;
+    assert.ok(columns.some((column) => column.name === "recent_4320_trade_count"));
+    assert.ok(columns.some((column) => column.name === "recent_4320_volume_sats"));
+
+    const aggregate = db.getTokenAggregateStats("legacy-token");
+    assert.equal(aggregate?.tradeCount, 3);
+    assert.equal(aggregate?.cumulativePaidSats, "999");
+    assert.equal(aggregate?.recent4320TradeCount, 0);
+    assert.equal(aggregate?.recent4320VolumeSats, "0");
+  } finally {
+    db.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
