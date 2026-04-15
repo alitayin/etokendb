@@ -35,6 +35,13 @@ export interface TradeListQuery extends PaginationQuery {
   tokenId?: string;
 }
 
+export type CandleInterval = "hour" | "day" | "week";
+
+export interface TokenCandleQuery {
+  interval: CandleInterval;
+  limit: number;
+}
+
 export interface ServiceStatus {
   ready: boolean;
   phase: BootstrapPhase;
@@ -102,6 +109,25 @@ export interface TradeHistoryItem {
   blockTimestamp: number | null;
 }
 
+export interface TokenCandle {
+  bucketStart: number;
+  bucketEnd: number;
+  openPriceNanosatsPerAtom: string;
+  highPriceNanosatsPerAtom: string;
+  lowPriceNanosatsPerAtom: string;
+  closePriceNanosatsPerAtom: string;
+  tradeCount: number;
+  volumeSats: string;
+  soldAtoms: string;
+}
+
+export interface TokenCandlesResult {
+  tokenId: string;
+  interval: CandleInterval;
+  timezone: string;
+  items: TokenCandle[];
+}
+
 export interface PaginatedResult<T> {
   page: number;
   pageSize: number;
@@ -118,5 +144,9 @@ export interface ServiceReadApi {
     tokenId: string,
     query: TradeListQuery,
   ): PaginatedResult<TradeHistoryItem>;
+  listTokenCandles(
+    tokenId: string,
+    query: TokenCandleQuery,
+  ): TokenCandlesResult;
   listTrades(query: TradeListQuery): PaginatedResult<TradeHistoryItem>;
 }

@@ -728,3 +728,99 @@ test("service returns concrete trade history fields from stored trades", () => {
     db.close();
   }
 });
+
+test("service returns aggregated token candles for charting", () => {
+  const db = openDatabase(":memory:");
+
+  db.upsertTrackedToken({
+    tokenId: "token-candles",
+    groupHex: "46token-candles",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady("token-candles", true, 1000);
+  db.insertProcessedTrades([
+    makeProcessedTrade({
+      tokenId: "token-candles",
+      offerTxid: "offer-open",
+      outIdx: 0,
+      spendTxid: "spend-open",
+      paidSats: "300",
+      blockHeight: 7000,
+      blockTimestamp: Math.floor(Date.parse("2026-04-13T10:05:00+08:00") / 1000),
+    }),
+    makeProcessedTrade({
+      tokenId: "token-candles",
+      offerTxid: "offer-close",
+      outIdx: 0,
+      spendTxid: "spend-close",
+      paidSats: "150",
+      blockHeight: 7001,
+      blockTimestamp: Math.floor(Date.parse("2026-04-13T10:45:00+08:00") / 1000),
+    }),
+  ]);
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 7001,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+    },
+  );
+
+  try {
+    const candles = service.listTokenCandles("token-candles", {
+      interval: "hour",
+      limit: 5,
+    });
+    assert.deepEqual(candles, {
+      tokenId: "token-candles",
+      interval: "hour",
+      timezone: "Asia/Shanghai",
+      items: [
+        {
+          bucketStart: Math.floor(Date.parse("2026-04-13T10:00:00+08:00") / 1000),
+          bucketEnd: Math.floor(Date.parse("2026-04-13T10:59:59+08:00") / 1000),
+          openPriceNanosatsPerAtom: "300",
+          highPriceNanosatsPerAtom: "300",
+          lowPriceNanosatsPerAtom: "150",
+          closePriceNanosatsPerAtom: "150",
+          tradeCount: 2,
+          volumeSats: "450",
+          soldAtoms: "2",
+        },
+      ],
+    });
+  } finally {
+    service.stop();
+    db.close();
+  }
+});

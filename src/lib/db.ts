@@ -6,11 +6,14 @@ import Database from "better-sqlite3";
 import { computeRollingStatsSnapshot } from "./stats.js";
 import type {
   ActiveTokenSeed,
+  CandleInterval,
+  ListTokenCandlesOptions,
   ListTokenStatsPageOptions,
   ListTradeHistoryOptions,
   ProcessedTradeRecord,
   TokenAggregateStatsRecord,
   TokenBlockStatsRecord,
+  TokenCandleRow,
   TokenInitStatus,
   TokenStatsPageRow,
   TokenStatsRecord,
@@ -55,7 +58,13 @@ export interface AppDatabase {
   getTokenAggregateStats: (tokenId: string) => TokenAggregateStatsRecord | null;
   listTokenStatsPage: (options: ListTokenStatsPageOptions) => TokenStatsPageRow[];
   listTradeHistory: (options: ListTradeHistoryOptions) => TradeHistoryRow[];
+  listTokenCandles: (options: ListTokenCandlesOptions) => TokenCandleRow[];
 }
+
+const SHANGHAI_OFFSET_SECONDS = 8 * 60 * 60;
+const DAY_SECONDS = 24 * 60 * 60;
+const WEEK_SECONDS = 7 * DAY_SECONDS;
+const MONDAY_ANCHOR_LOCAL_SECONDS = 4 * DAY_SECONDS;
 
 function ensureParentDir(filePath: string): void {
   if (filePath === ":memory:") {
@@ -326,6 +335,43 @@ function toTradeHistoryRow(row: Record<string, unknown>): TradeHistoryRow {
     rawTradeJson: row.raw_trade_json as string,
     insertedAt: row.inserted_at as number,
   };
+}
+
+function toTokenCandleRow(row: Record<string, unknown>): TokenCandleRow {
+  return {
+    bucketStart: Number(row.bucket_start),
+    bucketEnd: Number(row.bucket_end),
+    openPriceNanosatsPerAtom: String(row.open_price_nanosats_per_atom),
+    highPriceNanosatsPerAtom: String(row.high_price_nanosats_per_atom),
+    lowPriceNanosatsPerAtom: String(row.low_price_nanosats_per_atom),
+    closePriceNanosatsPerAtom: String(row.close_price_nanosats_per_atom),
+    tradeCount: Number(row.trade_count),
+    volumeSats: String(row.volume_sats),
+    soldAtoms: String(row.sold_atoms),
+  };
+}
+
+function candleBucketSql(interval: CandleInterval): {
+  bucketStartSql: string;
+  bucketSeconds: number;
+} {
+  switch (interval) {
+    case "hour":
+      return {
+        bucketStartSql: "CAST(block_timestamp / 3600 AS INTEGER) * 3600",
+        bucketSeconds: 3600,
+      };
+    case "day":
+      return {
+        bucketStartSql: `CAST((block_timestamp + ${SHANGHAI_OFFSET_SECONDS}) / ${DAY_SECONDS} AS INTEGER) * ${DAY_SECONDS} - ${SHANGHAI_OFFSET_SECONDS}`,
+        bucketSeconds: DAY_SECONDS,
+      };
+    case "week":
+      return {
+        bucketStartSql: `CAST(((block_timestamp + ${SHANGHAI_OFFSET_SECONDS}) - ${MONDAY_ANCHOR_LOCAL_SECONDS}) / ${WEEK_SECONDS} AS INTEGER) * ${WEEK_SECONDS} + ${MONDAY_ANCHOR_LOCAL_SECONDS} - ${SHANGHAI_OFFSET_SECONDS}`,
+        bucketSeconds: WEEK_SECONDS,
+      };
+  }
 }
 
 function toTokenBlockStatsRecord(
@@ -1005,6 +1051,100 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     LIMIT ? OFFSET ?
   `);
 
+  const listTokenCandlesStmtByInterval = new Map<CandleInterval, Database.Statement>();
+  for (const interval of ["hour", "day", "week"] as const) {
+    const { bucketStartSql, bucketSeconds } = candleBucketSql(interval);
+    listTokenCandlesStmtByInterval.set(
+      interval,
+      sqlite.prepare(`
+        WITH bucketed AS (
+          SELECT
+            ${bucketStartSql} AS bucket_start,
+            (${bucketStartSql} + ${bucketSeconds} - 1) AS bucket_end,
+            price_nanosats_per_atom,
+            paid_sats,
+            sold_atoms,
+            block_height,
+            block_timestamp,
+            inserted_at,
+            offer_txid,
+            offer_out_idx
+          FROM processed_trades
+          WHERE token_id = ?
+            AND block_timestamp IS NOT NULL
+        ),
+        ranked AS (
+          SELECT
+            bucket_start,
+            bucket_end,
+            price_nanosats_per_atom,
+            paid_sats,
+            sold_atoms,
+            ROW_NUMBER() OVER (
+              PARTITION BY bucket_start
+              ORDER BY
+                block_height ASC,
+                block_timestamp ASC,
+                inserted_at ASC,
+                offer_txid ASC,
+                offer_out_idx ASC
+            ) AS open_rank,
+            ROW_NUMBER() OVER (
+              PARTITION BY bucket_start
+              ORDER BY
+                block_height DESC,
+                block_timestamp DESC,
+                inserted_at DESC,
+                offer_txid DESC,
+                offer_out_idx DESC
+            ) AS close_rank
+          FROM bucketed
+        ),
+        aggregated AS (
+          SELECT
+            bucket_start,
+            bucket_end,
+            MAX(CASE WHEN open_rank = 1 THEN price_nanosats_per_atom END) AS open_price_nanosats_per_atom,
+            CAST(MAX(CAST(price_nanosats_per_atom AS INTEGER)) AS TEXT) AS high_price_nanosats_per_atom,
+            CAST(MIN(CAST(price_nanosats_per_atom AS INTEGER)) AS TEXT) AS low_price_nanosats_per_atom,
+            MAX(CASE WHEN close_rank = 1 THEN price_nanosats_per_atom END) AS close_price_nanosats_per_atom,
+            COUNT(*) AS trade_count,
+            COALESCE(CAST(SUM(CAST(paid_sats AS INTEGER)) AS TEXT), '0') AS volume_sats,
+            COALESCE(CAST(SUM(CAST(sold_atoms AS INTEGER)) AS TEXT), '0') AS sold_atoms
+          FROM ranked
+          GROUP BY bucket_start, bucket_end
+        ),
+        limited AS (
+          SELECT
+            bucket_start,
+            bucket_end,
+            open_price_nanosats_per_atom,
+            high_price_nanosats_per_atom,
+            low_price_nanosats_per_atom,
+            close_price_nanosats_per_atom,
+            trade_count,
+            volume_sats,
+            sold_atoms
+          FROM aggregated
+          ORDER BY bucket_start DESC
+          LIMIT ?
+        )
+        SELECT
+          bucket_start,
+          bucket_end,
+          open_price_nanosats_per_atom,
+          high_price_nanosats_per_atom,
+          low_price_nanosats_per_atom,
+          close_price_nanosats_per_atom,
+          trade_count,
+          volume_sats,
+          sold_atoms
+        FROM limited
+        ORDER BY bucket_start ASC
+      `),
+    );
+  }
+
   const setBootstrapCohortTx = sqlite.transaction((tokenIds: string[]) => {
     resetBootstrapStmt.run();
     for (const tokenId of tokenIds) {
@@ -1322,6 +1462,15 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       return (stmt.all(limit, offset) as Array<Record<string, unknown>>).map(
         toTradeHistoryRow,
       );
+    },
+    listTokenCandles: (options) => {
+      const stmt = listTokenCandlesStmtByInterval.get(options.interval);
+      if (!stmt) {
+        return [];
+      }
+      return (
+        stmt.all(options.tokenId, options.limit) as Array<Record<string, unknown>>
+      ).map(toTokenCandleRow);
     },
   };
 }

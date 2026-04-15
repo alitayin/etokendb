@@ -14,6 +14,9 @@ import type { AppConfig } from "../lib/config.js";
 import type { AppDatabase } from "../lib/db.js";
 import type { ActiveTokenSeed } from "../lib/types.js";
 import type {
+  TokenCandle,
+  TokenCandlesResult,
+  TokenCandleQuery,
   PaginatedResult,
   ServiceReadApi,
   ServiceStatus,
@@ -26,6 +29,7 @@ import type {
 } from "./contracts.js";
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
+const CANDLE_TIMEZONE = "Asia/Shanghai";
 
 type TokenPhase = "pending" | "initializing" | "catching-up" | "ready" | "error";
 
@@ -241,6 +245,28 @@ function toTradeHistoryItem(row: Record<string, unknown>): TradeHistoryItem {
       (row.block_timestamp ?? row.blockTimestamp) === undefined
         ? null
         : Number(row.block_timestamp ?? row.blockTimestamp),
+  };
+}
+
+function toTokenCandle(row: Record<string, unknown>): TokenCandle {
+  return {
+    bucketStart: Number(row.bucket_start ?? row.bucketStart),
+    bucketEnd: Number(row.bucket_end ?? row.bucketEnd),
+    openPriceNanosatsPerAtom: String(
+      row.open_price_nanosats_per_atom ?? row.openPriceNanosatsPerAtom,
+    ),
+    highPriceNanosatsPerAtom: String(
+      row.high_price_nanosats_per_atom ?? row.highPriceNanosatsPerAtom,
+    ),
+    lowPriceNanosatsPerAtom: String(
+      row.low_price_nanosats_per_atom ?? row.lowPriceNanosatsPerAtom,
+    ),
+    closePriceNanosatsPerAtom: String(
+      row.close_price_nanosats_per_atom ?? row.closePriceNanosatsPerAtom,
+    ),
+    tradeCount: Number(row.trade_count ?? row.tradeCount),
+    volumeSats: String(row.volume_sats ?? row.volumeSats),
+    soldAtoms: String(row.sold_atoms ?? row.soldAtoms),
   };
 }
 
@@ -487,6 +513,28 @@ export class AgoraTokenService implements ServiceReadApi {
     query: TradeListQuery,
   ): PaginatedResult<TradeHistoryItem> {
     return this.queryTrades({ ...query, tokenId });
+  }
+
+  listTokenCandles(
+    tokenId: string,
+    query: TokenCandleQuery,
+  ): TokenCandlesResult {
+    const limit = Math.min(
+      Math.max(1, query.limit),
+      this.config.apiPageSizeMax,
+    );
+    const rows = this.db.listTokenCandles({
+      tokenId,
+      interval: query.interval,
+      limit,
+    }) as unknown as Record<string, unknown>[];
+
+    return {
+      tokenId,
+      interval: query.interval,
+      timezone: CANDLE_TIMEZONE,
+      items: rows.map(toTokenCandle),
+    };
   }
 
   listTrades(query: TradeListQuery): PaginatedResult<TradeHistoryItem> {

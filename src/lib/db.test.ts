@@ -36,6 +36,10 @@ function makeTrade(params: {
   };
 }
 
+function unixSeconds(iso8601: string): number {
+  return Math.floor(Date.parse(iso8601) / 1000);
+}
+
 test("tracked token lifecycle fields support bootstrap/init/ready progress", () => {
   const db = openDatabase(":memory:");
 
@@ -383,6 +387,219 @@ test("listTokenStatsPage and listTradeHistory return paginated rows", () => {
     });
     assert.equal(globalTrades.length, 1);
     assert.equal(globalTrades[0]?.offerTxid, "b1");
+  } finally {
+    db.close();
+  }
+});
+
+test("listTokenCandles aggregates hourly and daily OHLCV in Asia/Shanghai buckets", () => {
+  const db = openDatabase(":memory:");
+
+  try {
+    const tokenId = "token-candles";
+    db.insertProcessedTrades([
+      makeTrade({
+        tokenId,
+        offerTxid: "h1-open",
+        outIdx: 0,
+        spendTxid: "sh1-open",
+        paidSats: "300",
+        soldAtoms: "3",
+        blockHeight: 1000,
+        blockTimestamp: unixSeconds("2026-04-13T10:05:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "h1-low",
+        outIdx: 0,
+        spendTxid: "sh1-low",
+        paidSats: "100",
+        soldAtoms: "1",
+        blockHeight: 1000,
+        blockTimestamp: unixSeconds("2026-04-13T10:25:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "h1-close",
+        outIdx: 0,
+        spendTxid: "sh1-close",
+        paidSats: "200",
+        soldAtoms: "2",
+        blockHeight: 1000,
+        blockTimestamp: unixSeconds("2026-04-13T10:55:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "h2-single",
+        outIdx: 0,
+        spendTxid: "sh2-single",
+        paidSats: "150",
+        soldAtoms: "5",
+        blockHeight: 1001,
+        blockTimestamp: unixSeconds("2026-04-13T11:10:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "d2-single",
+        outIdx: 0,
+        spendTxid: "sd2-single",
+        paidSats: "90",
+        soldAtoms: "1",
+        blockHeight: 1002,
+        blockTimestamp: unixSeconds("2026-04-14T09:00:00+08:00"),
+      }),
+    ]);
+
+    const hourly = db.listTokenCandles({
+      tokenId,
+      interval: "hour",
+      limit: 10,
+    });
+    assert.equal(hourly.length, 3);
+    assert.deepEqual(hourly[0], {
+      bucketStart: unixSeconds("2026-04-13T10:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-13T10:59:59+08:00"),
+      openPriceNanosatsPerAtom: "300",
+      highPriceNanosatsPerAtom: "300",
+      lowPriceNanosatsPerAtom: "100",
+      closePriceNanosatsPerAtom: "200",
+      tradeCount: 3,
+      volumeSats: "600",
+      soldAtoms: "6",
+    });
+    assert.deepEqual(hourly[1], {
+      bucketStart: unixSeconds("2026-04-13T11:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-13T11:59:59+08:00"),
+      openPriceNanosatsPerAtom: "150",
+      highPriceNanosatsPerAtom: "150",
+      lowPriceNanosatsPerAtom: "150",
+      closePriceNanosatsPerAtom: "150",
+      tradeCount: 1,
+      volumeSats: "150",
+      soldAtoms: "5",
+    });
+    assert.deepEqual(hourly[2], {
+      bucketStart: unixSeconds("2026-04-14T09:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-14T09:59:59+08:00"),
+      openPriceNanosatsPerAtom: "90",
+      highPriceNanosatsPerAtom: "90",
+      lowPriceNanosatsPerAtom: "90",
+      closePriceNanosatsPerAtom: "90",
+      tradeCount: 1,
+      volumeSats: "90",
+      soldAtoms: "1",
+    });
+
+    const daily = db.listTokenCandles({
+      tokenId,
+      interval: "day",
+      limit: 10,
+    });
+    assert.equal(daily.length, 2);
+    assert.deepEqual(daily[0], {
+      bucketStart: unixSeconds("2026-04-13T00:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-13T23:59:59+08:00"),
+      openPriceNanosatsPerAtom: "300",
+      highPriceNanosatsPerAtom: "300",
+      lowPriceNanosatsPerAtom: "100",
+      closePriceNanosatsPerAtom: "150",
+      tradeCount: 4,
+      volumeSats: "750",
+      soldAtoms: "11",
+    });
+    assert.deepEqual(daily[1], {
+      bucketStart: unixSeconds("2026-04-14T00:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-14T23:59:59+08:00"),
+      openPriceNanosatsPerAtom: "90",
+      highPriceNanosatsPerAtom: "90",
+      lowPriceNanosatsPerAtom: "90",
+      closePriceNanosatsPerAtom: "90",
+      tradeCount: 1,
+      volumeSats: "90",
+      soldAtoms: "1",
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("listTokenCandles aggregates weekly buckets and returns the latest limited buckets in ascending order", () => {
+  const db = openDatabase(":memory:");
+
+  try {
+    const tokenId = "token-weekly-candles";
+    db.insertProcessedTrades([
+      makeTrade({
+        tokenId,
+        offerTxid: "prev-week",
+        outIdx: 0,
+        spendTxid: "sprev-week",
+        paidSats: "70",
+        soldAtoms: "1",
+        blockHeight: 900,
+        blockTimestamp: unixSeconds("2026-04-12T23:30:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "week-open",
+        outIdx: 0,
+        spendTxid: "sweek-open",
+        paidSats: "120",
+        soldAtoms: "2",
+        blockHeight: 901,
+        blockTimestamp: unixSeconds("2026-04-13T01:00:00+08:00"),
+      }),
+      makeTrade({
+        tokenId,
+        offerTxid: "week-close",
+        outIdx: 0,
+        spendTxid: "sweek-close",
+        paidSats: "80",
+        soldAtoms: "3",
+        blockHeight: 902,
+        blockTimestamp: unixSeconds("2026-04-15T12:00:00+08:00"),
+      }),
+    ]);
+
+    const weekly = db.listTokenCandles({
+      tokenId,
+      interval: "week",
+      limit: 2,
+    });
+    assert.equal(weekly.length, 2);
+    assert.deepEqual(weekly[0], {
+      bucketStart: unixSeconds("2026-04-06T00:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-12T23:59:59+08:00"),
+      openPriceNanosatsPerAtom: "70",
+      highPriceNanosatsPerAtom: "70",
+      lowPriceNanosatsPerAtom: "70",
+      closePriceNanosatsPerAtom: "70",
+      tradeCount: 1,
+      volumeSats: "70",
+      soldAtoms: "1",
+    });
+    assert.deepEqual(weekly[1], {
+      bucketStart: unixSeconds("2026-04-13T00:00:00+08:00"),
+      bucketEnd: unixSeconds("2026-04-19T23:59:59+08:00"),
+      openPriceNanosatsPerAtom: "120",
+      highPriceNanosatsPerAtom: "120",
+      lowPriceNanosatsPerAtom: "80",
+      closePriceNanosatsPerAtom: "80",
+      tradeCount: 2,
+      volumeSats: "200",
+      soldAtoms: "5",
+    });
+
+    const latestOnly = db.listTokenCandles({
+      tokenId,
+      interval: "week",
+      limit: 1,
+    });
+    assert.equal(latestOnly.length, 1);
+    assert.equal(
+      latestOnly[0]?.bucketStart,
+      unixSeconds("2026-04-13T00:00:00+08:00"),
+    );
   } finally {
     db.close();
   }

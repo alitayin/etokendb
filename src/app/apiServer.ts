@@ -6,8 +6,10 @@ import {
 } from "node:http";
 
 import type {
+  CandleInterval,
   ServiceReadApi,
   TokenListQuery,
+  TokenCandleQuery,
   TokenSortField,
   TradeListQuery,
 } from "./contracts.js";
@@ -57,8 +59,10 @@ class ApiHttpError extends Error {
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 50;
 const DEFAULT_MAX_PAGE_SIZE = 200;
+const DEFAULT_CANDLE_LIMIT = 200;
 const DEFAULT_TOKEN_SORT: TokenSortField = "recent144VolumeSats";
 const DEFAULT_ORDER: "asc" | "desc" = "desc";
+const CANDLE_INTERVALS = new Set<CandleInterval>(["hour", "day", "week"]);
 
 const TOKEN_SORT_FIELDS = new Set<TokenSortField>([
   "totalTradeCount",
@@ -154,6 +158,20 @@ function parseReadyOnly(rawValue: string | null): boolean | undefined {
     return false;
   }
   throw new ApiHttpError(400, "INVALID_QUERY", "readyOnly must be true or false");
+}
+
+function parseCandleInterval(rawValue: string | null): CandleInterval {
+  if (rawValue === null || rawValue.length === 0) {
+    return "day";
+  }
+  if (CANDLE_INTERVALS.has(rawValue as CandleInterval)) {
+    return rawValue as CandleInterval;
+  }
+  throw new ApiHttpError(
+    400,
+    "INVALID_QUERY",
+    `interval must be one of: ${Array.from(CANDLE_INTERVALS).join(", ")}`,
+  );
 }
 
 function methodNotAllowed(res: ServerResponse): void {
@@ -272,6 +290,31 @@ async function routeRequest(
       throw new ApiHttpError(404, "TOKEN_NOT_FOUND", `Token not found: ${tokenId}`);
     }
     sendJson(res, 200, { ok: true, data: token });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "candles"
+  ) {
+    const tokenId = segments[2];
+    const query: TokenCandleQuery = {
+      interval: parseCandleInterval(parsedUrl.searchParams.get("interval")),
+      limit: parsePositiveInt(
+        parsedUrl.searchParams.get("limit"),
+        "limit",
+        DEFAULT_CANDLE_LIMIT,
+        options.maxPageSize,
+      ),
+    };
+    const token = await dataService.getToken(tokenId);
+    if (!token) {
+      throw new ApiHttpError(404, "TOKEN_NOT_FOUND", `Token not found: ${tokenId}`);
+    }
+    const result = await dataService.listTokenCandles(tokenId, query);
+    sendJson(res, 200, { ok: true, data: result });
     return;
   }
 

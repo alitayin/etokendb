@@ -7,6 +7,9 @@ import {
   type ApiDataService,
 } from "./apiServer.js";
 import type {
+  TokenCandle,
+  TokenCandlesResult,
+  TokenCandleQuery,
   PaginatedResult,
   ServiceStatus,
   TokenDetail,
@@ -137,6 +140,20 @@ function sampleTrade(tokenId = "token-1", idx = 0): TradeHistoryItem {
   };
 }
 
+function sampleCandle(idx = 0): TokenCandle {
+  return {
+    bucketStart: 1_000 + idx * 3_600,
+    bucketEnd: 4_599 + idx * 3_600,
+    openPriceNanosatsPerAtom: "100",
+    highPriceNanosatsPerAtom: "120",
+    lowPriceNanosatsPerAtom: "90",
+    closePriceNanosatsPerAtom: "110",
+    tradeCount: 3,
+    volumeSats: "500",
+    soldAtoms: "50",
+  };
+}
+
 function makeBaseService(): ApiDataService {
   return {
     isHealthy: () => true,
@@ -149,6 +166,12 @@ function makeBaseService(): ApiDataService {
       page: query.page,
       pageSize: query.pageSize,
       total: 0,
+    }),
+    listTokenCandles: (tokenId, query) => ({
+      tokenId,
+      interval: query.interval,
+      timezone: "Asia/Shanghai",
+      items: [],
     }),
   };
 }
@@ -257,6 +280,45 @@ test("token detail and token trades endpoints return data and 404", async () => 
   assert.equal(missingTrades.statusCode, 404);
 });
 
+test("token candles endpoint parses query and returns chart data", async () => {
+  let capturedCandleQuery: TokenCandleQuery | null = null;
+  const tokenDetail = sampleTokenDetail("token-a");
+  const candleResult: TokenCandlesResult = {
+    tokenId: "token-a",
+    interval: "week",
+    timezone: "Asia/Shanghai",
+    items: [sampleCandle(0), sampleCandle(1)],
+  };
+
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    getToken: (tokenId) => (tokenId === "token-a" ? tokenDetail : null),
+    listTokenCandles: (tokenId, query) => {
+      capturedCandleQuery = query;
+      assert.equal(tokenId, "token-a");
+      return candleResult;
+    },
+  };
+
+  const response = await invoke(
+    service,
+    "GET",
+    "/api/tokens/token-a/candles?interval=week&limit=20",
+  );
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(capturedCandleQuery, {
+    interval: "week",
+    limit: 20,
+  });
+  assert.deepEqual(response.bodyJson, {
+    ok: true,
+    data: candleResult,
+  });
+
+  const missing = await invoke(service, "GET", "/api/tokens/token-missing/candles");
+  assert.equal(missing.statusCode, 404);
+});
+
 test("global trades endpoint is optional", async () => {
   const disabled = await invoke(makeBaseService(), "GET", "/api/trades");
   assert.equal(disabled.statusCode, 404);
@@ -295,6 +357,13 @@ test("invalid query and method return proper errors", async () => {
 
   const invalidReadyOnly = await invoke(service, "GET", "/api/tokens?readyOnly=1");
   assert.equal(invalidReadyOnly.statusCode, 400);
+
+  const invalidInterval = await invoke(
+    service,
+    "GET",
+    "/api/tokens/token-a/candles?interval=month",
+  );
+  assert.equal(invalidInterval.statusCode, 400);
 
   const method = await invoke(service, "POST", "/healthz");
   assert.equal(method.statusCode, 405);

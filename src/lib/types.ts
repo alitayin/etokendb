@@ -29,6 +29,14 @@ export interface ListTradeHistoryOptions {
   order?: "asc" | "desc";
 }
 
+export type CandleInterval = "hour" | "day" | "week";
+
+export interface ListTokenCandlesOptions {
+  tokenId: string;
+  interval: CandleInterval;
+  limit: number;
+}
+
 export interface ActiveTokenSeed {
   tokenId: string;
   groupHex: string;
@@ -122,6 +130,18 @@ export interface TokenRollingStatsSnapshot {
 
 export interface TradeHistoryRow extends ProcessedTradeRecord {
   insertedAt: number;
+}
+
+export interface TokenCandleRow {
+  bucketStart: number;
+  bucketEnd: number;
+  openPriceNanosatsPerAtom: string;
+  highPriceNanosatsPerAtom: string;
+  lowPriceNanosatsPerAtom: string;
+  closePriceNanosatsPerAtom: string;
+  tradeCount: number;
+  volumeSats: string;
+  soldAtoms: string;
 }
 
 export interface TokenSyncResult {
