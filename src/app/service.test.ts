@@ -645,3 +645,86 @@ test("service exposes latest price and rolling stats in token list and detail vi
     db.close();
   }
 });
+
+test("service returns concrete trade history fields from stored trades", () => {
+  const db = openDatabase(":memory:");
+
+  db.upsertTrackedToken({
+    tokenId: "token-trades",
+    groupHex: "46token-trades",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady("token-trades", true, 1000);
+  db.insertProcessedTrades([
+    makeProcessedTrade({
+      tokenId: "token-trades",
+      offerTxid: "offer-trades",
+      outIdx: 3,
+      spendTxid: "spend-trades",
+      paidSats: "250",
+      blockHeight: 5000,
+      blockTimestamp: 50_000,
+    }),
+  ]);
+  db.recomputeAllTokenAggregateStats(5000);
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 5000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+    },
+  );
+
+  try {
+    const trades = service.listTokenTrades("token-trades", {
+      page: 1,
+      pageSize: 10,
+    });
+    assert.equal(trades.total, 1);
+    assert.deepEqual(trades.items[0], {
+      tokenId: "token-trades",
+      offerTxid: "offer-trades",
+      offerOutIdx: 3,
+      spendTxid: "spend-trades",
+      paidSats: "250",
+      soldAtoms: "1",
+      priceNanosatsPerAtom: "250",
+      takerScriptHex: null,
+      blockHeight: 5000,
+      blockTimestamp: 50000,
+    });
+  } finally {
+    service.stop();
+    db.close();
+  }
+});

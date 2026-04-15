@@ -211,22 +211,36 @@ function toTokenSummary(row: Record<string, unknown>): TokenSummary {
 
 function toTradeHistoryItem(row: Record<string, unknown>): TradeHistoryItem {
   return {
-    tokenId: row.token_id as string,
-    offerTxid: row.offer_txid as string,
-    offerOutIdx: Number(row.offer_out_idx),
-    spendTxid: row.spend_txid as string,
-    paidSats: String(row.paid_sats),
-    soldAtoms: String(row.sold_atoms),
-    priceNanosatsPerAtom: String(row.price_nanosats_per_atom),
-    takerScriptHex: (row.taker_script_hex as string | null) ?? null,
+    tokenId: (row.token_id as string | undefined) ?? (row.tokenId as string),
+    offerTxid: (row.offer_txid as string | undefined) ?? (row.offerTxid as string),
+    offerOutIdx: Number(
+      (row.offer_out_idx as number | undefined) ?? (row.offerOutIdx as number),
+    ),
+    spendTxid: (row.spend_txid as string | undefined) ?? (row.spendTxid as string),
+    paidSats: String(
+      (row.paid_sats as string | undefined) ?? (row.paidSats as string),
+    ),
+    soldAtoms: String(
+      (row.sold_atoms as string | undefined) ?? (row.soldAtoms as string),
+    ),
+    priceNanosatsPerAtom: String(
+      (row.price_nanosats_per_atom as string | undefined) ??
+        (row.priceNanosatsPerAtom as string),
+    ),
+    takerScriptHex:
+      ((row.taker_script_hex as string | null | undefined) ??
+        (row.takerScriptHex as string | null | undefined)) ??
+      null,
     blockHeight:
-      row.block_height === null || row.block_height === undefined
+      (row.block_height ?? row.blockHeight) === null ||
+      (row.block_height ?? row.blockHeight) === undefined
         ? null
-        : Number(row.block_height),
+        : Number(row.block_height ?? row.blockHeight),
     blockTimestamp:
-      row.block_timestamp === null || row.block_timestamp === undefined
+      (row.block_timestamp ?? row.blockTimestamp) === null ||
+      (row.block_timestamp ?? row.blockTimestamp) === undefined
         ? null
-        : Number(row.block_timestamp),
+        : Number(row.block_timestamp ?? row.blockTimestamp),
   };
 }
 
