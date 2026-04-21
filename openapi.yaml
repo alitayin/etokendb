@@ -1,0 +1,991 @@
+openapi: 3.1.0
+info:
+  title: etokendb API
+  version: 0.1.0
+  summary: Public read-only API for token metrics, trade history, candles, and server-side access analytics
+  description: |
+    etokendb exposes a GET-only JSON API backed by SQLite.
+
+    Response envelopes:
+
+    - Success: `{ "ok": true, "data": ... }`
+    - Error: `{ "ok": false, "error": { "code": "...", "message": "..." } }`
+
+    General rules:
+
+    - All endpoints are GET only
+    - Unsupported methods return `405 METHOD_NOT_ALLOWED`
+    - Counts are numbers
+    - Large satoshi and price values are strings to preserve precision
+    - Analytics time buckets use Unix milliseconds
+    - Trade block timestamps and candle bucket timestamps use Unix seconds
+servers:
+  - url: http://127.0.0.1:8787
+    description: Local default server
+  - url: https://etokendb.alitayin.com
+    description: Production example
+tags:
+  - name: Health
+  - name: Status
+  - name: Tokens
+  - name: Trades
+  - name: Analytics
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: getHealthz
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Service is not healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness check
+      operationId: getReadyz
+      responses:
+        "200":
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+  /api/status:
+    get:
+      tags: [Status]
+      summary: Runtime and sync status
+      operationId: getStatus
+      responses:
+        "200":
+          description: Runtime status snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiStatusResponse"
+  /api/tokens:
+    get:
+      tags: [Tokens]
+      summary: List token summaries
+      operationId: listTokens
+      parameters:
+        - $ref: "#/components/parameters/PageParam"
+        - $ref: "#/components/parameters/PageSizeParam"
+        - name: sort
+          in: query
+          required: false
+          description: Sort field. Effective default is `recent144VolumeSats`.
+          schema:
+            $ref: "#/components/schemas/TokenSortField"
+        - name: order
+          in: query
+          required: false
+          description: Sort order. Effective default is `desc`.
+          schema:
+            $ref: "#/components/schemas/SortOrder"
+        - name: readyOnly
+          in: query
+          required: false
+          description: |
+            Filter to ready tokens only. If omitted, the current implementation behaves as if `true`.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: Paginated token summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTokenSummaryResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}:
+    get:
+      tags: [Tokens]
+      summary: Get a single token
+      operationId: getToken
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+      responses:
+        "200":
+          description: Token detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenDetailResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/trades:
+    get:
+      tags: [Tokens, Trades]
+      summary: List trade history for one token
+      operationId: listTokenTrades
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+        - $ref: "#/components/parameters/PageParam"
+        - $ref: "#/components/parameters/PageSizeParam"
+      responses:
+        "200":
+          description: Paginated token trade history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTradeHistoryResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/candles:
+    get:
+      tags: [Tokens]
+      summary: Get OHLCV candles for one token
+      operationId: getTokenCandles
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+        - name: interval
+          in: query
+          required: false
+          description: Candle interval. Default is `day`.
+          schema:
+            $ref: "#/components/schemas/CandleInterval"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of buckets to return. Default `200`, max `200`.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 200
+      responses:
+        "200":
+          description: Token candle series
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenCandlesResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/trades:
+    get:
+      tags: [Trades]
+      summary: List global trade history
+      operationId: listTrades
+      parameters:
+        - $ref: "#/components/parameters/PageParam"
+        - $ref: "#/components/parameters/PageSizeParam"
+      responses:
+        "200":
+          description: Paginated global trade history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTradeHistoryResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/analytics/summary:
+    get:
+      tags: [Analytics]
+      summary: Get site-wide access analytics summary
+      operationId: getAnalyticsSummary
+      parameters:
+        - $ref: "#/components/parameters/HoursParam"
+      responses:
+        "200":
+          description: Site-wide API access and token visit analytics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalyticsSummaryResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/analytics/endpoints:
+    get:
+      tags: [Analytics]
+      summary: List analytics summaries for all tracked endpoints
+      operationId: listEndpointAnalytics
+      parameters:
+        - $ref: "#/components/parameters/HoursParam"
+      responses:
+        "200":
+          description: Per-endpoint access analytics summary rows
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EndpointAnalyticsListResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/analytics/endpoints/{routeKey}:
+    get:
+      tags: [Analytics]
+      summary: Get analytics detail for one endpoint
+      operationId: getEndpointAnalytics
+      parameters:
+        - name: routeKey
+          in: path
+          required: true
+          description: Fixed endpoint analytics route key
+          schema:
+            $ref: "#/components/schemas/AnalyticsRouteKey"
+        - $ref: "#/components/parameters/HoursParam"
+      responses:
+        "200":
+          description: Endpoint analytics detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EndpointAnalyticsDetailResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/analytics/tokens:
+    get:
+      tags: [Analytics]
+      summary: List token visit leaderboard rows
+      operationId: listTokenVisits
+      parameters:
+        - $ref: "#/components/parameters/PageParam"
+        - $ref: "#/components/parameters/PageSizeParam"
+        - name: sort
+          in: query
+          required: false
+          description: Visit leaderboard sort field. Effective default is `visitsTotal`.
+          schema:
+            $ref: "#/components/schemas/TokenVisitSortField"
+        - name: order
+          in: query
+          required: false
+          description: Sort order. Effective default is `desc`.
+          schema:
+            $ref: "#/components/schemas/SortOrder"
+      responses:
+        "200":
+          description: Paginated token visit leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTokenVisitSummaryResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/analytics/tokens/{tokenId}:
+    get:
+      tags: [Analytics]
+      summary: Get visit analytics for one token
+      operationId: getTokenVisitAnalytics
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+        - $ref: "#/components/parameters/HoursParam"
+      responses:
+        "200":
+          description: Token visit analytics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenVisitAnalyticsResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+components:
+  parameters:
+    TokenIdPathParam:
+      name: tokenId
+      in: path
+      required: true
+      description: Token identifier
+      schema:
+        type: string
+    PageParam:
+      name: page
+      in: query
+      required: false
+      description: 1-based page number. Default `1`.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeParam:
+      name: pageSize
+      in: query
+      required: false
+      description: Page size. Default `50`, max `200`.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    HoursParam:
+      name: hours
+      in: query
+      required: false
+      description: |
+        Rolling analytics window in hours. Default `168`. The maximum is capped by the deployment's analytics retention setting, which defaults to `2160`.
+      schema:
+        type: integer
+        minimum: 1
+        default: 168
+  responses:
+    ErrorResponse:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    SortOrder:
+      type: string
+      enum: [asc, desc]
+    BootstrapPhase:
+      type: string
+      enum:
+        - starting
+        - discovering
+        - subscribing
+        - initializing
+        - ready
+        - degraded
+        - error
+    TokenInitStatus:
+      type: string
+      enum:
+        - PENDING
+        - INITIALIZING
+        - READY
+        - ERROR
+    CandleInterval:
+      type: string
+      enum: [hour, day, week]
+    TokenSortField:
+      type: string
+      enum:
+        - totalTradeCount
+        - totalVolumeSats
+        - latestPriceNanosatsPerAtom
+        - recent144TradeCount
+        - recent144VolumeSats
+        - recent1008TradeCount
+        - recent1008VolumeSats
+        - recent4320TradeCount
+        - recent4320VolumeSats
+        - lastTradeBlockHeight
+        - lastTradeBlockTimestamp
+    TokenVisitSortField:
+      type: string
+      enum:
+        - visitsTotal
+        - visits24h
+        - lastVisitedAt
+    AnalyticsRouteKey:
+      type: string
+      enum:
+        - status
+        - tokens.list
+        - tokens.detail
+        - tokens.trades
+        - tokens.candles
+        - trades.list
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+    HealthData:
+      type: object
+      required: [healthy]
+      properties:
+        healthy:
+          type: boolean
+    HealthResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/HealthData"
+    ReadyData:
+      type: object
+      required: [ready]
+      properties:
+        ready:
+          type: boolean
+    ReadyResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/ReadyData"
+    ApiStatusData:
+      type: object
+      required:
+        - healthy
+        - ready
+        - phase
+        - wsConnected
+        - chronikUrl
+        - dbPath
+        - dbSizeBytes
+        - startedAt
+        - statusDate
+        - statusTimezone
+        - tipHeight
+        - totalTrackedTokenCount
+        - activeTokenCount
+        - readyTokenCount
+        - tradedTokenCount
+        - discoveredTodayCount
+        - activeDiscoveredTodayCount
+        - bootstrapTokenCount
+        - bootstrapReadyCount
+        - discoveryPageCount
+        - lastDiscoveryAt
+        - lastTipUpdateAt
+        - lastError
+      properties:
+        healthy:
+          type: boolean
+        ready:
+          type: boolean
+        phase:
+          $ref: "#/components/schemas/BootstrapPhase"
+        wsConnected:
+          type: boolean
+        chronikUrl:
+          type: string
+        dbPath:
+          type: string
+        dbSizeBytes:
+          type: integer
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+        statusDate:
+          type: string
+        statusTimezone:
+          type: string
+        tipHeight:
+          type: integer
+          nullable: true
+        totalTrackedTokenCount:
+          type: integer
+        activeTokenCount:
+          type: integer
+        readyTokenCount:
+          type: integer
+        tradedTokenCount:
+          type: integer
+        discoveredTodayCount:
+          type: integer
+        activeDiscoveredTodayCount:
+          type: integer
+        bootstrapTokenCount:
+          type: integer
+        bootstrapReadyCount:
+          type: integer
+        discoveryPageCount:
+          type: integer
+        lastDiscoveryAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastTipUpdateAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastError:
+          type: string
+          nullable: true
+    ApiStatusResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/ApiStatusData"
+    TokenSummary:
+      type: object
+      required:
+        - tokenId
+        - isActive
+        - isReady
+        - bootstrapCohort
+        - totalTradeCount
+        - totalVolumeSats
+        - latestPriceNanosatsPerAtom
+        - recent144TradeCount
+        - recent144VolumeSats
+        - recent144PriceChangeBps
+        - recent144PriceChangePct
+        - recent1008TradeCount
+        - recent1008VolumeSats
+        - recent4320TradeCount
+        - recent4320VolumeSats
+        - lastTradeBlockHeight
+        - lastTradeBlockTimestamp
+        - lastSyncedAt
+        - lastWsEventAt
+        - visitCountTotal
+        - visitCount24h
+        - lastVisitedAt
+      properties:
+        tokenId:
+          type: string
+        isActive:
+          type: boolean
+        isReady:
+          type: boolean
+        bootstrapCohort:
+          type: boolean
+        totalTradeCount:
+          type: integer
+        totalVolumeSats:
+          type: string
+        latestPriceNanosatsPerAtom:
+          type: string
+          nullable: true
+        recent144TradeCount:
+          type: integer
+        recent144VolumeSats:
+          type: string
+        recent144PriceChangeBps:
+          type: string
+        recent144PriceChangePct:
+          type: string
+        recent1008TradeCount:
+          type: integer
+        recent1008VolumeSats:
+          type: string
+        recent4320TradeCount:
+          type: integer
+        recent4320VolumeSats:
+          type: string
+        lastTradeBlockHeight:
+          type: integer
+          nullable: true
+        lastTradeBlockTimestamp:
+          type: integer
+          nullable: true
+        lastSyncedAt:
+          type: integer
+          nullable: true
+        lastWsEventAt:
+          type: integer
+          nullable: true
+        visitCountTotal:
+          type: integer
+        visitCount24h:
+          type: integer
+        lastVisitedAt:
+          type: integer
+          nullable: true
+    TokenDetail:
+      type: object
+      required: [summary, firstDiscoveredAt, lastDiscoveredAt, initStatus]
+      properties:
+        summary:
+          $ref: "#/components/schemas/TokenSummary"
+        firstDiscoveredAt:
+          type: integer
+        lastDiscoveredAt:
+          type: integer
+        initStatus:
+          $ref: "#/components/schemas/TokenInitStatus"
+    TokenDetailResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/TokenDetail"
+    PaginatedTokenSummary:
+      type: object
+      required: [page, pageSize, total, items]
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenSummary"
+    PaginatedTokenSummaryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/PaginatedTokenSummary"
+    TradeHistoryItem:
+      type: object
+      required:
+        - tokenId
+        - offerTxid
+        - offerOutIdx
+        - spendTxid
+        - paidSats
+        - soldAtoms
+        - priceNanosatsPerAtom
+        - takerScriptHex
+        - blockHeight
+        - blockTimestamp
+      properties:
+        tokenId:
+          type: string
+        offerTxid:
+          type: string
+        offerOutIdx:
+          type: integer
+        spendTxid:
+          type: string
+        paidSats:
+          type: string
+        soldAtoms:
+          type: string
+        priceNanosatsPerAtom:
+          type: string
+        takerScriptHex:
+          type: string
+          nullable: true
+        blockHeight:
+          type: integer
+          nullable: true
+        blockTimestamp:
+          type: integer
+          nullable: true
+    PaginatedTradeHistory:
+      type: object
+      required: [page, pageSize, total, items]
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TradeHistoryItem"
+    PaginatedTradeHistoryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/PaginatedTradeHistory"
+    TokenCandle:
+      type: object
+      required:
+        - bucketStart
+        - bucketEnd
+        - openPriceNanosatsPerAtom
+        - highPriceNanosatsPerAtom
+        - lowPriceNanosatsPerAtom
+        - closePriceNanosatsPerAtom
+        - tradeCount
+        - volumeSats
+        - soldAtoms
+      properties:
+        bucketStart:
+          type: integer
+        bucketEnd:
+          type: integer
+        openPriceNanosatsPerAtom:
+          type: string
+        highPriceNanosatsPerAtom:
+          type: string
+        lowPriceNanosatsPerAtom:
+          type: string
+        closePriceNanosatsPerAtom:
+          type: string
+        tradeCount:
+          type: integer
+        volumeSats:
+          type: string
+        soldAtoms:
+          type: string
+    TokenCandlesResult:
+      type: object
+      required: [tokenId, interval, timezone, items]
+      properties:
+        tokenId:
+          type: string
+        interval:
+          $ref: "#/components/schemas/CandleInterval"
+        timezone:
+          type: string
+          example: Asia/Shanghai
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenCandle"
+    TokenCandlesResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/TokenCandlesResult"
+    ApiAccessBucket:
+      type: object
+      required:
+        - bucketStart
+        - bucketEnd
+        - accessCount
+        - successCount
+        - clientErrorCount
+        - serverErrorCount
+      properties:
+        bucketStart:
+          type: integer
+        bucketEnd:
+          type: integer
+        accessCount:
+          type: integer
+        successCount:
+          type: integer
+        clientErrorCount:
+          type: integer
+        serverErrorCount:
+          type: integer
+    TokenVisitBucket:
+      type: object
+      required: [bucketStart, bucketEnd, visitCount]
+      properties:
+        bucketStart:
+          type: integer
+        bucketEnd:
+          type: integer
+        visitCount:
+          type: integer
+    AnalyticsSummary:
+      type: object
+      required:
+        - hours
+        - windowStart
+        - windowEnd
+        - apiAccessCountTotal
+        - apiAccessCountWindow
+        - apiAccessBuckets
+        - tokenVisitCountTotal
+        - tokenVisitCountWindow
+        - tokenVisitBuckets
+      properties:
+        hours:
+          type: integer
+        windowStart:
+          type: integer
+        windowEnd:
+          type: integer
+        apiAccessCountTotal:
+          type: integer
+        apiAccessCountWindow:
+          type: integer
+        apiAccessBuckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiAccessBucket"
+        tokenVisitCountTotal:
+          type: integer
+        tokenVisitCountWindow:
+          type: integer
+        tokenVisitBuckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenVisitBucket"
+    AnalyticsSummaryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/AnalyticsSummary"
+    EndpointAnalyticsSummary:
+      type: object
+      required:
+        - routeKey
+        - accessCountTotal
+        - accessCountWindow
+        - successCountTotal
+        - successCountWindow
+        - clientErrorCountTotal
+        - clientErrorCountWindow
+        - serverErrorCountTotal
+        - serverErrorCountWindow
+        - lastAccessedAt
+      properties:
+        routeKey:
+          $ref: "#/components/schemas/AnalyticsRouteKey"
+        accessCountTotal:
+          type: integer
+        accessCountWindow:
+          type: integer
+        successCountTotal:
+          type: integer
+        successCountWindow:
+          type: integer
+        clientErrorCountTotal:
+          type: integer
+        clientErrorCountWindow:
+          type: integer
+        serverErrorCountTotal:
+          type: integer
+        serverErrorCountWindow:
+          type: integer
+        lastAccessedAt:
+          type: integer
+          nullable: true
+    EndpointAnalyticsDetail:
+      allOf:
+        - $ref: "#/components/schemas/EndpointAnalyticsSummary"
+        - type: object
+          required: [hours, windowStart, windowEnd, buckets]
+          properties:
+            hours:
+              type: integer
+            windowStart:
+              type: integer
+            windowEnd:
+              type: integer
+            buckets:
+              type: array
+              items:
+                $ref: "#/components/schemas/ApiAccessBucket"
+    EndpointAnalyticsListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/EndpointAnalyticsSummary"
+    EndpointAnalyticsDetailResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/EndpointAnalyticsDetail"
+    TokenVisitSummary:
+      type: object
+      required: [tokenId, visitCountTotal, visitCount24h, lastVisitedAt]
+      properties:
+        tokenId:
+          type: string
+        visitCountTotal:
+          type: integer
+        visitCount24h:
+          type: integer
+        lastVisitedAt:
+          type: integer
+          nullable: true
+    TokenVisitAnalytics:
+      allOf:
+        - $ref: "#/components/schemas/TokenVisitSummary"
+        - type: object
+          required:
+            - hours
+            - windowStart
+            - windowEnd
+            - visitCountWindow
+            - buckets
+          properties:
+            hours:
+              type: integer
+            windowStart:
+              type: integer
+            windowEnd:
+              type: integer
+            visitCountWindow:
+              type: integer
+            buckets:
+              type: array
+              items:
+                $ref: "#/components/schemas/TokenVisitBucket"
+    PaginatedTokenVisitSummary:
+      type: object
+      required: [page, pageSize, total, items]
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenVisitSummary"
+    PaginatedTokenVisitSummaryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/PaginatedTokenVisitSummary"
+    TokenVisitAnalyticsResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/TokenVisitAnalytics"

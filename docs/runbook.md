@@ -1,5 +1,11 @@
 # etokendb Runbook
 
+Additional docs:
+
+- API handbook: [api.md](./api.md)
+- OpenAPI spec: [../openapi.yaml](../openapi.yaml)
+- Project overview: [../README.md](../README.md)
+
 ## 1. First deploy on a VPS
 
 ### System packages
@@ -67,12 +73,25 @@ If you want a custom threshold, pass it on the CLI:
 npm start -- --defer-known-trade-count-lte=1
 ```
 
+Convenience script for the common `<= 1 trade` threshold:
+
+```bash
+npm run start:skip-lte1
+```
+
 ### Start under PM2
 
 ```bash
 pm2 start npm --name etokendb -- start
 pm2 save
 pm2 startup
+```
+
+If you want the `tradeCount <= 1` bootstrap deferral mode under PM2, start it with the script explicitly:
+
+```bash
+pm2 start npm --name etokendb -- run start:skip-lte1
+pm2 save
 ```
 
 ## 2. Update workflow
@@ -90,8 +109,21 @@ If you deployed with trade-count bootstrap deferral:
 ```bash
 git pull
 npm install
-pm2 restart etokendb --update-env
-pm2 start npm --name etokendb -- run start:skip-zero
+pm2 restart etokendb
+```
+
+Important:
+
+- `pm2 restart etokendb` keeps the existing start command.
+- Restarting does not switch bootstrap modes by itself.
+- To switch from normal startup to `start:skip-zero` or `start:skip-lte1`, recreate the PM2 process with the intended command.
+
+Example:
+
+```bash
+pm2 delete etokendb
+pm2 start npm --name etokendb -- run start:skip-lte1
+pm2 save
 ```
 
 ### Safer path
@@ -138,7 +170,13 @@ Main endpoints:
 - `GET /api/tokens`
 - `GET /api/tokens/:tokenId`
 - `GET /api/tokens/:tokenId/trades`
+- `GET /api/tokens/:tokenId/candles`
 - `GET /api/trades`
+- `GET /api/analytics/summary`
+- `GET /api/analytics/endpoints`
+- `GET /api/analytics/endpoints/:routeKey`
+- `GET /api/analytics/tokens`
+- `GET /api/analytics/tokens/:tokenId`
 
 Useful local checks:
 
@@ -147,6 +185,9 @@ curl http://127.0.0.1:8787/api/status
 curl "http://127.0.0.1:8787/api/tokens?page=1&pageSize=20"
 curl "http://127.0.0.1:8787/api/tokens/<tokenId>"
 curl "http://127.0.0.1:8787/api/tokens/<tokenId>/trades?page=1&pageSize=20"
+curl "http://127.0.0.1:8787/api/tokens/<tokenId>/candles?interval=day&limit=30"
+curl "http://127.0.0.1:8787/api/analytics/summary?hours=24"
+curl "http://127.0.0.1:8787/api/analytics/endpoints?hours=168"
 ```
 
 Local DB reports:
@@ -162,6 +203,7 @@ Useful startup commands:
 ```bash
 npm start
 npm run start:skip-zero
+npm run start:skip-lte1
 npm start -- --defer-known-trade-count-lte=1
 ```
 
