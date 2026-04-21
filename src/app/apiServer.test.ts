@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
 
+import type { ApiAccessRecord } from "../lib/analytics.js";
 import {
   createApiRequestHandler,
   type ApiDataService,
+  type ApiServerOptions,
 } from "./apiServer.js";
 import type {
+  AnalyticsSummary,
+  EndpointAnalyticsDetail,
+  EndpointAnalyticsSummary,
   TokenCandle,
   TokenCandlesResult,
   TokenCandleQuery,
@@ -15,6 +20,9 @@ import type {
   TokenDetail,
   TokenListQuery,
   TokenSummary,
+  TokenVisitListQuery,
+  TokenVisitAnalytics,
+  TokenVisitSummary,
   TradeHistoryItem,
   TradeListQuery,
 } from "./contracts.js";
@@ -30,8 +38,9 @@ async function invoke(
   service: ApiDataService,
   method: string,
   url: string,
+  options: ApiServerOptions = {},
 ): Promise<MockResponseResult> {
-  const handler = createApiRequestHandler(service);
+  const handler = createApiRequestHandler(service, options);
   const request = { method, url } as IncomingMessage;
 
   let bodyText = "";
@@ -113,6 +122,9 @@ function sampleTokenSummary(tokenId = "token-1"): TokenSummary {
     lastTradeBlockTimestamp: 222,
     lastSyncedAt: 333,
     lastWsEventAt: 444,
+    visitCountTotal: 7,
+    visitCount24h: 3,
+    lastVisitedAt: 555,
   };
 }
 
@@ -154,6 +166,98 @@ function sampleCandle(idx = 0): TokenCandle {
   };
 }
 
+function sampleAnalyticsSummary(hours = 168): AnalyticsSummary {
+  return {
+    hours,
+    windowStart: 1_000,
+    windowEnd: 2_000,
+    apiAccessCountTotal: 20,
+    apiAccessCountWindow: 12,
+    apiAccessBuckets: [
+      {
+        bucketStart: 1_000,
+        bucketEnd: 4_599,
+        accessCount: 5,
+        successCount: 4,
+        clientErrorCount: 1,
+        serverErrorCount: 0,
+      },
+    ],
+    tokenVisitCountTotal: 9,
+    tokenVisitCountWindow: 4,
+    tokenVisitBuckets: [
+      {
+        bucketStart: 1_000,
+        bucketEnd: 4_599,
+        visitCount: 2,
+      },
+    ],
+  };
+}
+
+function sampleEndpointAnalyticsSummary(): EndpointAnalyticsSummary {
+  return {
+    routeKey: "tokens.detail",
+    accessCountTotal: 10,
+    accessCountWindow: 6,
+    successCountTotal: 8,
+    successCountWindow: 5,
+    clientErrorCountTotal: 2,
+    clientErrorCountWindow: 1,
+    serverErrorCountTotal: 0,
+    serverErrorCountWindow: 0,
+    lastAccessedAt: 9_999,
+  };
+}
+
+function sampleEndpointAnalyticsDetail(hours = 168): EndpointAnalyticsDetail {
+  return {
+    ...sampleEndpointAnalyticsSummary(),
+    hours,
+    windowStart: 1_000,
+    windowEnd: 2_000,
+    buckets: [
+      {
+        bucketStart: 1_000,
+        bucketEnd: 4_599,
+        accessCount: 3,
+        successCount: 2,
+        clientErrorCount: 1,
+        serverErrorCount: 0,
+      },
+    ],
+  };
+}
+
+function sampleTokenVisitSummary(tokenId = "token-1"): TokenVisitSummary {
+  return {
+    tokenId,
+    visitCountTotal: 8,
+    visitCount24h: 3,
+    lastVisitedAt: 6_789,
+  };
+}
+
+function sampleTokenVisitAnalytics(
+  tokenId = "token-1",
+  hours = 168,
+): TokenVisitAnalytics {
+  return {
+    ...sampleTokenVisitSummary(tokenId),
+    hours,
+    windowStart: 1_000,
+    windowEnd: 2_000,
+    visitCountWindow: 4,
+    buckets: [
+      {
+        bucketStart: 1_000,
+        bucketEnd: 4_599,
+        visitCount: 2,
+      },
+    ],
+  };
+}
+
 function makeBaseService(): ApiDataService {
   return {
     isHealthy: () => true,
@@ -161,6 +265,51 @@ function makeBaseService(): ApiDataService {
     getStatus: () => sampleStatus(),
     listTokens: () => ({ items: [], page: 1, pageSize: 50, total: 0 }),
     getToken: () => null,
+    getAnalyticsSummary: (hours) => ({
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      apiAccessCountTotal: 0,
+      apiAccessCountWindow: 0,
+      apiAccessBuckets: [],
+      tokenVisitCountTotal: 0,
+      tokenVisitCountWindow: 0,
+      tokenVisitBuckets: [],
+    }),
+    listEndpointAnalytics: () => [],
+    getEndpointAnalytics: (_routeKey, hours) => ({
+      routeKey: "status",
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      accessCountTotal: 0,
+      accessCountWindow: 0,
+      successCountTotal: 0,
+      successCountWindow: 0,
+      clientErrorCountTotal: 0,
+      clientErrorCountWindow: 0,
+      serverErrorCountTotal: 0,
+      serverErrorCountWindow: 0,
+      lastAccessedAt: null,
+      buckets: [],
+    }),
+    listTokenVisits: (query) => ({
+      items: [],
+      page: query.page,
+      pageSize: query.pageSize,
+      total: 0,
+    }),
+    getTokenVisitAnalytics: (_tokenId, hours) => ({
+      tokenId: "token-1",
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      visitCountTotal: 0,
+      visitCount24h: 0,
+      visitCountWindow: 0,
+      lastVisitedAt: null,
+      buckets: [],
+    }),
     listTokenTrades: (_tokenId, query) => ({
       items: [],
       page: query.page,
@@ -196,6 +345,135 @@ test("healthz, readyz and status expose service state", async () => {
       ...sampleStatus(),
     },
   });
+});
+
+test("analytics endpoints parse queries and return data", async () => {
+  let capturedSummaryHours = 0;
+  let capturedEndpointsHours = 0;
+  let capturedEndpointDetail: { routeKey: string; hours: number } | null = null;
+  let capturedTokenVisitsQuery: TokenVisitListQuery | null = null;
+  let capturedTokenVisitDetail: { tokenId: string; hours: number } | null = null;
+
+  const summary = sampleAnalyticsSummary(24);
+  const endpointSummary = sampleEndpointAnalyticsSummary();
+  const endpointDetail = sampleEndpointAnalyticsDetail(72);
+  const tokenVisitAnalytics = sampleTokenVisitAnalytics("token-a", 96);
+
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    getAnalyticsSummary: (hours) => {
+      capturedSummaryHours = hours;
+      return summary;
+    },
+    listEndpointAnalytics: (hours) => {
+      capturedEndpointsHours = hours;
+      return [endpointSummary];
+    },
+    getEndpointAnalytics: (routeKey, hours) => {
+      capturedEndpointDetail = { routeKey, hours };
+      return endpointDetail;
+    },
+    listTokenVisits: (query) => {
+      capturedTokenVisitsQuery = query;
+      return {
+        page: query.page,
+        pageSize: query.pageSize,
+        total: 1,
+        items: [sampleTokenVisitSummary("token-a")],
+      };
+    },
+    getTokenVisitAnalytics: (tokenId, hours) => {
+      capturedTokenVisitDetail = { tokenId, hours };
+      return tokenId === "token-a" ? tokenVisitAnalytics : null;
+    },
+  };
+
+  const summaryResponse = await invoke(
+    service,
+    "GET",
+    "/api/analytics/summary?hours=24",
+  );
+  assert.equal(summaryResponse.statusCode, 200);
+  assert.equal(capturedSummaryHours, 24);
+  assert.deepEqual(summaryResponse.bodyJson, { ok: true, data: summary });
+
+  const endpointsResponse = await invoke(
+    service,
+    "GET",
+    "/api/analytics/endpoints?hours=48",
+  );
+  assert.equal(endpointsResponse.statusCode, 200);
+  assert.equal(capturedEndpointsHours, 48);
+  assert.deepEqual(endpointsResponse.bodyJson, {
+    ok: true,
+    data: [endpointSummary],
+  });
+
+  const endpointDetailResponse = await invoke(
+    service,
+    "GET",
+    "/api/analytics/endpoints/tokens.detail?hours=72",
+  );
+  assert.equal(endpointDetailResponse.statusCode, 200);
+  assert.deepEqual(capturedEndpointDetail, {
+    routeKey: "tokens.detail",
+    hours: 72,
+  });
+  assert.deepEqual(endpointDetailResponse.bodyJson, {
+    ok: true,
+    data: endpointDetail,
+  });
+
+  const tokenVisitsResponse = await invoke(
+    service,
+    "GET",
+    "/api/analytics/tokens?page=2&pageSize=25&sort=lastVisitedAt&order=asc",
+  );
+  assert.equal(tokenVisitsResponse.statusCode, 200);
+  assert.deepEqual(capturedTokenVisitsQuery, {
+    page: 2,
+    pageSize: 25,
+    sort: "lastVisitedAt",
+    order: "asc",
+  });
+  assert.deepEqual(tokenVisitsResponse.bodyJson, {
+    ok: true,
+    data: {
+      page: 2,
+      pageSize: 25,
+      total: 1,
+      items: [sampleTokenVisitSummary("token-a")],
+    },
+  });
+
+  const tokenVisitDetailResponse = await invoke(
+    service,
+    "GET",
+    "/api/analytics/tokens/token-a?hours=96",
+  );
+  assert.equal(tokenVisitDetailResponse.statusCode, 200);
+  assert.deepEqual(capturedTokenVisitDetail, {
+    tokenId: "token-a",
+    hours: 96,
+  });
+  assert.deepEqual(tokenVisitDetailResponse.bodyJson, {
+    ok: true,
+    data: tokenVisitAnalytics,
+  });
+
+  const missingToken = await invoke(
+    service,
+    "GET",
+    "/api/analytics/tokens/token-missing?hours=24",
+  );
+  assert.equal(missingToken.statusCode, 404);
+
+  const invalidRoute = await invoke(
+    service,
+    "GET",
+    "/api/analytics/endpoints/not-a-route",
+  );
+  assert.equal(invalidRoute.statusCode, 404);
 });
 
 test("list tokens parses pagination and sorting query", async () => {
@@ -370,4 +648,57 @@ test("invalid query and method return proper errors", async () => {
 
   const missing = await invoke(service, "GET", "/api/unknown");
   assert.equal(missing.statusCode, 404);
+});
+
+test("analytics recorder tracks matched business routes only after final status is known", async () => {
+  const recorded: ApiAccessRecord[] = [];
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    getToken: (tokenId) => (tokenId === "token-a" ? sampleTokenDetail(tokenId) : null),
+  };
+  const options: ApiServerOptions = {
+    analyticsRecorder: {
+      recordApiAccess: (entry) => {
+        recorded.push(entry);
+      },
+    },
+    logger: {
+      warn: () => {},
+    },
+  };
+
+  await invoke(service, "GET", "/healthz", options);
+  await invoke(service, "GET", "/api/status", options);
+  await invoke(service, "POST", "/api/tokens", options);
+  await invoke(service, "GET", "/api/tokens/token-a", options);
+  await invoke(service, "GET", "/api/tokens/token-missing", options);
+  await invoke(service, "GET", "/api/unknown", options);
+  await invoke(service, "GET", "/api/analytics/summary", options);
+
+  assert.deepEqual(recorded, [
+    {
+      routeKey: "status",
+      statusCode: 200,
+      tokenId: undefined,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "tokens.list",
+      statusCode: 405,
+      tokenId: undefined,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-a",
+      countTokenVisit: true,
+    },
+    {
+      routeKey: "tokens.detail",
+      statusCode: 404,
+      tokenId: "token-missing",
+      countTokenVisit: false,
+    },
+  ]);
 });

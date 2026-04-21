@@ -605,6 +605,204 @@ test("listTokenCandles aggregates weekly buckets and returns the latest limited 
   }
 });
 
+test("recordApiAccess aggregates route stats and token visits into hourly buckets", () => {
+  const db = openDatabase(":memory:");
+  const baseMs = Date.parse("2026-04-20T10:15:00.000Z");
+  const sameHourMs = Date.parse("2026-04-20T10:45:00.000Z");
+  const previousHourMs = Date.parse("2026-04-20T09:15:00.000Z");
+  const previous30hMs = Date.parse("2026-04-19T04:15:00.000Z");
+
+  try {
+    db.upsertTrackedToken({
+      tokenId: "token-a",
+      groupHex: "46token-a",
+      groupPrefixHex: "46",
+      kind: "FUNGIBLE",
+    });
+    db.upsertTrackedToken({
+      tokenId: "token-b",
+      groupHex: "46token-b",
+      groupPrefixHex: "46",
+      kind: "FUNGIBLE",
+    });
+
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-a",
+      countTokenVisit: true,
+      occurredAtMs: baseMs,
+    });
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 404,
+      tokenId: "token-a",
+      countTokenVisit: false,
+      occurredAtMs: sameHourMs,
+    });
+    db.recordApiAccess({
+      routeKey: "tokens.list",
+      statusCode: 400,
+      occurredAtMs: previousHourMs,
+    });
+    db.recordApiAccess({
+      routeKey: "status",
+      statusCode: 200,
+      occurredAtMs: previousHourMs,
+    });
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-a",
+      countTokenVisit: true,
+      occurredAtMs: previous30hMs,
+    });
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-b",
+      countTokenVisit: true,
+      occurredAtMs: previousHourMs,
+    });
+
+    const detailBucketCount = db.sqlite
+      .prepare(
+        `
+          SELECT COUNT(*) AS count
+          FROM api_route_access_hourly
+          WHERE route_key = 'tokens.detail'
+        `,
+      )
+      .get() as { count: number };
+    assert.equal(detailBucketCount.count, 3);
+
+    const endpointAnalytics = db.listEndpointAnalytics({
+      hours: 48,
+      nowMs: baseMs,
+    });
+    const detailAnalytics = endpointAnalytics.find(
+      (item) => item.routeKey === "tokens.detail",
+    );
+    assert.deepEqual(detailAnalytics, {
+      routeKey: "tokens.detail",
+      accessCountTotal: 4,
+      accessCountWindow: 4,
+      successCountTotal: 3,
+      successCountWindow: 3,
+      clientErrorCountTotal: 1,
+      clientErrorCountWindow: 1,
+      serverErrorCountTotal: 0,
+      serverErrorCountWindow: 0,
+      lastAccessedAt: sameHourMs,
+    });
+
+    const summary = db.getAnalyticsSummary({
+      hours: 48,
+      nowMs: baseMs,
+    });
+    assert.equal(summary.apiAccessCountTotal, 6);
+    assert.equal(summary.apiAccessCountWindow, 6);
+    assert.equal(summary.tokenVisitCountTotal, 3);
+    assert.equal(summary.tokenVisitCountWindow, 3);
+    assert.equal(summary.apiAccessBuckets.length, 48);
+    assert.equal(summary.tokenVisitBuckets.length, 48);
+
+    const tokenSnapshot = db.getTokenVisitSnapshot("token-a", baseMs);
+    assert.deepEqual(tokenSnapshot, {
+      visitCountTotal: 2,
+      visitCount24h: 1,
+      lastVisitedAt: baseMs,
+    });
+
+    const tokenAnalytics = db.getTokenVisitAnalytics({
+      tokenId: "token-a",
+      hours: 48,
+      nowMs: baseMs,
+    });
+    assert.equal(tokenAnalytics.visitCountTotal, 2);
+    assert.equal(tokenAnalytics.visitCount24h, 1);
+    assert.equal(tokenAnalytics.visitCountWindow, 2);
+    assert.equal(tokenAnalytics.buckets.length, 48);
+
+    const tokenVisits = db.listTokenVisits({
+      page: 1,
+      pageSize: 10,
+      offset: 0,
+      sort: "visitsTotal",
+      order: "desc",
+      nowMs: baseMs,
+    });
+    assert.deepEqual(tokenVisits.items.slice(0, 2), [
+      {
+        tokenId: "token-a",
+        visitCountTotal: 2,
+        visitCount24h: 1,
+        lastVisitedAt: baseMs,
+      },
+      {
+        tokenId: "token-b",
+        visitCountTotal: 1,
+        visitCount24h: 1,
+        lastVisitedAt: previousHourMs,
+      },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("pruneOldAnalyticsBuckets removes stale hourly buckets without touching totals", () => {
+  const db = openDatabase(":memory:");
+  const nowMs = Date.parse("2026-04-20T10:15:00.000Z");
+  const oldMs = Date.parse("2026-04-18T09:15:00.000Z");
+
+  try {
+    db.upsertTrackedToken({
+      tokenId: "token-prune",
+      groupHex: "46token-prune",
+      groupPrefixHex: "46",
+      kind: "FUNGIBLE",
+    });
+
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-prune",
+      countTokenVisit: true,
+      occurredAtMs: oldMs,
+    });
+    db.recordApiAccess({
+      routeKey: "tokens.detail",
+      statusCode: 200,
+      tokenId: "token-prune",
+      countTokenVisit: true,
+      occurredAtMs: nowMs,
+    });
+
+    const pruned = db.pruneOldAnalyticsBuckets(24, nowMs);
+    assert.equal(pruned.apiRouteBucketCount, 1);
+    assert.equal(pruned.tokenVisitBucketCount, 1);
+
+    const detailAnalytics = db.getEndpointAnalytics({
+      routeKey: "tokens.detail",
+      hours: 48,
+      nowMs,
+    });
+    assert.equal(detailAnalytics.accessCountTotal, 2);
+    assert.equal(detailAnalytics.accessCountWindow, 1);
+
+    const tokenAnalytics = db.getTokenVisitAnalytics({
+      tokenId: "token-prune",
+      hours: 48,
+      nowMs,
+    });
+    assert.equal(tokenAnalytics.visitCountTotal, 2);
+    assert.equal(tokenAnalytics.visitCountWindow, 1);
+  } finally {
+    db.close();
+  }
+});
+
 test("openDatabase migrates legacy token_stats rows to include 30 day rolling columns", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "etokendb-legacy-"));
   const sqlitePath = path.join(tempDir, "legacy.sqlite");
@@ -684,6 +882,29 @@ test("openDatabase migrates legacy token_stats rows to include 30 day rolling co
     assert.equal(aggregate?.recent4320TradeCount, 0);
     assert.equal(aggregate?.recent4320VolumeSats, "0");
     assert.equal(aggregate?.lastTradePriceNanosatsPerAtom, null);
+
+    const tables = db.sqlite
+      .prepare(
+        `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'table'
+            AND name IN (
+              'api_route_access_totals',
+              'api_route_access_hourly',
+              'token_visit_totals',
+              'token_visit_hourly'
+            )
+          ORDER BY name ASC
+        `,
+      )
+      .all() as Array<{ name: string }>;
+    assert.deepEqual(tables.map((table) => table.name), [
+      "api_route_access_hourly",
+      "api_route_access_totals",
+      "token_visit_hourly",
+      "token_visit_totals",
+    ]);
   } finally {
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });

@@ -1,5 +1,7 @@
 import "dotenv/config";
 
+import { DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS } from "./analytics.js";
+
 export interface AppConfig {
   chronikUrl: string;
   sqlitePath: string;
@@ -13,6 +15,7 @@ export interface AppConfig {
   bootstrapConcurrency: number;
   apiPageSizeDefault: number;
   apiPageSizeMax: number;
+  analyticsHourlyRetentionHours: number;
   requestTimeoutMs: number;
   requestRetryCount: number;
   wsConnectTimeoutMs: number;
@@ -70,6 +73,10 @@ export function loadConfig(): AppConfig {
     bootstrapConcurrency: readPositiveInt("BOOTSTRAP_CONCURRENCY", 8),
     apiPageSizeDefault: readPositiveInt("API_PAGE_SIZE_DEFAULT", 50),
     apiPageSizeMax: readPositiveInt("API_PAGE_SIZE_MAX", 200),
+    analyticsHourlyRetentionHours: readPositiveInt(
+      "ANALYTICS_HOURLY_RETENTION_HOURS",
+      DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS,
+    ),
     requestTimeoutMs: readPositiveInt("REQUEST_TIMEOUT_MS", 20_000),
     requestRetryCount: readPositiveInt("REQUEST_RETRY_COUNT", 3),
     wsConnectTimeoutMs: readPositiveInt("WS_CONNECT_TIMEOUT_MS", 10_000),

@@ -1,3 +1,5 @@
+import type { AnalyticsRouteKey } from "../lib/analytics.js";
+
 export type BootstrapPhase =
   | "starting"
   | "discovering"
@@ -87,6 +89,9 @@ export interface TokenSummary {
   lastTradeBlockTimestamp: number | null;
   lastSyncedAt: number | null;
   lastWsEventAt: number | null;
+  visitCountTotal: number;
+  visitCount24h: number;
+  lastVisitedAt: number | null;
 }
 
 export interface TokenDetail {
@@ -135,11 +140,88 @@ export interface PaginatedResult<T> {
   items: T[];
 }
 
+export interface ApiAccessBucket {
+  bucketStart: number;
+  bucketEnd: number;
+  accessCount: number;
+  successCount: number;
+  clientErrorCount: number;
+  serverErrorCount: number;
+}
+
+export interface TokenVisitBucket {
+  bucketStart: number;
+  bucketEnd: number;
+  visitCount: number;
+}
+
+export interface AnalyticsSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  apiAccessCountTotal: number;
+  apiAccessCountWindow: number;
+  apiAccessBuckets: ApiAccessBucket[];
+  tokenVisitCountTotal: number;
+  tokenVisitCountWindow: number;
+  tokenVisitBuckets: TokenVisitBucket[];
+}
+
+export interface EndpointAnalyticsSummary {
+  routeKey: AnalyticsRouteKey;
+  accessCountTotal: number;
+  accessCountWindow: number;
+  successCountTotal: number;
+  successCountWindow: number;
+  clientErrorCountTotal: number;
+  clientErrorCountWindow: number;
+  serverErrorCountTotal: number;
+  serverErrorCountWindow: number;
+  lastAccessedAt: number | null;
+}
+
+export interface EndpointAnalyticsDetail extends EndpointAnalyticsSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  buckets: ApiAccessBucket[];
+}
+
+export type TokenVisitSortField = "visitsTotal" | "visits24h" | "lastVisitedAt";
+
+export interface TokenVisitListQuery extends PaginationQuery {
+  sort?: TokenVisitSortField;
+  order?: "asc" | "desc";
+}
+
+export interface TokenVisitSummary {
+  tokenId: string;
+  visitCountTotal: number;
+  visitCount24h: number;
+  lastVisitedAt: number | null;
+}
+
+export interface TokenVisitAnalytics extends TokenVisitSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  visitCountWindow: number;
+  buckets: TokenVisitBucket[];
+}
+
 export interface ServiceReadApi {
   getStatus(): ServiceStatus;
   isReady(): boolean;
   listTokens(query: TokenListQuery): PaginatedResult<TokenSummary>;
   getToken(tokenId: string): TokenDetail | null;
+  getAnalyticsSummary(hours: number): AnalyticsSummary;
+  listEndpointAnalytics(hours: number): EndpointAnalyticsSummary[];
+  getEndpointAnalytics(
+    routeKey: AnalyticsRouteKey,
+    hours: number,
+  ): EndpointAnalyticsDetail;
+  listTokenVisits(query: TokenVisitListQuery): PaginatedResult<TokenVisitSummary>;
+  getTokenVisitAnalytics(tokenId: string, hours: number): TokenVisitAnalytics | null;
   listTokenTrades(
     tokenId: string,
     query: TradeListQuery,

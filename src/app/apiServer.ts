@@ -5,12 +5,21 @@ import {
   type ServerResponse,
 } from "node:http";
 
+import {
+  DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS,
+  DEFAULT_ANALYTICS_QUERY_HOURS,
+  type AnalyticsRouteKey,
+  type ApiAccessRecord,
+  isAnalyticsRouteKey,
+} from "../lib/analytics.js";
 import type {
   CandleInterval,
   ServiceReadApi,
   TokenListQuery,
   TokenCandleQuery,
   TokenSortField,
+  TokenVisitListQuery,
+  TokenVisitSortField,
   TradeListQuery,
 } from "./contracts.js";
 
@@ -23,8 +32,15 @@ export interface ApiDataService
   listTrades?: ServiceReadApi["listTrades"];
 }
 
+export interface AnalyticsRecorder {
+  recordApiAccess: (entry: ApiAccessRecord) => void;
+}
+
 export interface ApiServerOptions {
   maxPageSize?: number;
+  maxAnalyticsHours?: number;
+  analyticsRecorder?: AnalyticsRecorder;
+  logger?: Pick<Console, "warn">;
 }
 
 export type ApiRequestHandler = (
@@ -43,6 +59,16 @@ interface JsonErrorBody {
 interface JsonSuccessBody<T> {
   ok: true;
   data: T;
+}
+
+interface ParsedRequestContext {
+  parsedUrl: URL;
+  segments: string[];
+}
+
+interface BusinessRouteMatch {
+  routeKey: AnalyticsRouteKey;
+  tokenId?: string;
 }
 
 class ApiHttpError extends Error {
@@ -78,6 +104,12 @@ const TOKEN_SORT_FIELDS = new Set<TokenSortField>([
   "lastTradeBlockTimestamp",
 ]);
 
+const TOKEN_VISIT_SORT_FIELDS = new Set<TokenVisitSortField>([
+  "visitsTotal",
+  "visits24h",
+  "lastVisitedAt",
+]);
+
 function sendJson<T>(
   res: ServerResponse,
   statusCode: number,
@@ -101,6 +133,61 @@ function toPathSegments(pathname: string): string[] {
         throw new ApiHttpError(400, "BAD_PATH", "Invalid path segment encoding");
       }
     });
+}
+
+function parseRequestContext(req: IncomingMessage): ParsedRequestContext {
+  const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+  return {
+    parsedUrl,
+    segments: toPathSegments(parsedUrl.pathname),
+  };
+}
+
+function classifyBusinessRoute(segments: string[]): BusinessRouteMatch | null {
+  if (segments.length === 2 && segments[0] === "api" && segments[1] === "status") {
+    return { routeKey: "status" };
+  }
+
+  if (segments.length === 2 && segments[0] === "api" && segments[1] === "tokens") {
+    return { routeKey: "tokens.list" };
+  }
+
+  if (segments.length === 3 && segments[0] === "api" && segments[1] === "tokens") {
+    return {
+      routeKey: "tokens.detail",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "trades"
+  ) {
+    return {
+      routeKey: "tokens.trades",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "candles"
+  ) {
+    return {
+      routeKey: "tokens.candles",
+      tokenId: segments[2],
+    };
+  }
+
+  if (segments.length === 2 && segments[0] === "api" && segments[1] === "trades") {
+    return { routeKey: "trades.list" };
+  }
+
+  return null;
 }
 
 function parsePositiveInt(
@@ -133,6 +220,15 @@ function parseSortOrder(rawValue: string | null): "asc" | "desc" {
   throw new ApiHttpError(400, "INVALID_QUERY", "order must be asc or desc");
 }
 
+function parseAnalyticsHours(rawValue: string | null, maxHours: number): number {
+  return parsePositiveInt(
+    rawValue,
+    "hours",
+    DEFAULT_ANALYTICS_QUERY_HOURS,
+    maxHours,
+  );
+}
+
 function parseTokenSortField(rawValue: string | null): TokenSortField {
   if (rawValue === null || rawValue.length === 0) {
     return DEFAULT_TOKEN_SORT;
@@ -144,6 +240,20 @@ function parseTokenSortField(rawValue: string | null): TokenSortField {
     400,
     "INVALID_QUERY",
     `sort must be one of: ${Array.from(TOKEN_SORT_FIELDS).join(", ")}`,
+  );
+}
+
+function parseTokenVisitSortField(rawValue: string | null): TokenVisitSortField {
+  if (rawValue === null || rawValue.length === 0) {
+    return "visitsTotal";
+  }
+  if (TOKEN_VISIT_SORT_FIELDS.has(rawValue as TokenVisitSortField)) {
+    return rawValue as TokenVisitSortField;
+  }
+  throw new ApiHttpError(
+    400,
+    "INVALID_QUERY",
+    `sort must be one of: ${Array.from(TOKEN_VISIT_SORT_FIELDS).join(", ")}`,
   );
 }
 
@@ -209,14 +319,14 @@ async function routeRequest(
   res: ServerResponse,
   dataService: ApiDataService,
   options: Required<ApiServerOptions>,
+  context: ParsedRequestContext,
 ): Promise<void> {
   if (req.method !== "GET") {
     methodNotAllowed(res);
     return;
   }
 
-  const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
-  const segments = toPathSegments(parsedUrl.pathname);
+  const { parsedUrl, segments } = context;
 
   if (segments.length === 1 && segments[0] === "healthz") {
     const healthy = dataService.isHealthy ? await dataService.isHealthy() : true;
@@ -236,6 +346,119 @@ async function routeRequest(
       data: {
         ready,
       },
+    });
+    return;
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "analytics" &&
+    segments[2] === "summary"
+  ) {
+    const hours = parseAnalyticsHours(
+      parsedUrl.searchParams.get("hours"),
+      options.maxAnalyticsHours,
+    );
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.getAnalyticsSummary(hours),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "analytics" &&
+    segments[2] === "endpoints"
+  ) {
+    const hours = parseAnalyticsHours(
+      parsedUrl.searchParams.get("hours"),
+      options.maxAnalyticsHours,
+    );
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.listEndpointAnalytics(hours),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "analytics" &&
+    segments[2] === "endpoints"
+  ) {
+    const routeKey = segments[3];
+    if (!isAnalyticsRouteKey(routeKey)) {
+      throw new ApiHttpError(
+        404,
+        "ROUTE_NOT_FOUND",
+        `Analytics route not found: ${routeKey}`,
+      );
+    }
+    const hours = parseAnalyticsHours(
+      parsedUrl.searchParams.get("hours"),
+      options.maxAnalyticsHours,
+    );
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.getEndpointAnalytics(routeKey, hours),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "analytics" &&
+    segments[2] === "tokens"
+  ) {
+    const query: TokenVisitListQuery = {
+      page: parsePositiveInt(
+        parsedUrl.searchParams.get("page"),
+        "page",
+        DEFAULT_PAGE,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      pageSize: parsePositiveInt(
+        parsedUrl.searchParams.get("pageSize"),
+        "pageSize",
+        DEFAULT_PAGE_SIZE,
+        options.maxPageSize,
+      ),
+      sort: parseTokenVisitSortField(parsedUrl.searchParams.get("sort")),
+      order: parseSortOrder(parsedUrl.searchParams.get("order")),
+    };
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.listTokenVisits(query),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "analytics" &&
+    segments[2] === "tokens"
+  ) {
+    const hours = parseAnalyticsHours(
+      parsedUrl.searchParams.get("hours"),
+      options.maxAnalyticsHours,
+    );
+    const analytics = await dataService.getTokenVisitAnalytics(segments[3], hours);
+    if (!analytics) {
+      throw new ApiHttpError(
+        404,
+        "TOKEN_NOT_FOUND",
+        `Token not found: ${segments[3]}`,
+      );
+    }
+    sendJson(res, 200, {
+      ok: true,
+      data: analytics,
     });
     return;
   }
@@ -391,24 +614,52 @@ export function createApiRequestHandler(
 ): ApiRequestHandler {
   const resolvedOptions: Required<ApiServerOptions> = {
     maxPageSize: options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE,
+    maxAnalyticsHours:
+      options.maxAnalyticsHours ?? DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS,
+    analyticsRecorder: options.analyticsRecorder ?? {
+      recordApiAccess: () => {},
+    },
+    logger: options.logger ?? console,
   };
 
   return async (req, res) => {
+    let routeMatch: BusinessRouteMatch | null = null;
     try {
-      await routeRequest(req, res, dataService, resolvedOptions);
+      const context = parseRequestContext(req);
+      routeMatch = classifyBusinessRoute(context.segments);
+      await routeRequest(req, res, dataService, resolvedOptions, context);
     } catch (error) {
       if (error instanceof ApiHttpError) {
         sendHttpError(res, error);
-        return;
+      } else {
+        sendJson(res, 500, {
+          ok: false,
+          error: {
+            code: "INTERNAL_ERROR",
+            message: "Internal server error",
+          },
+        });
       }
+    }
 
-      sendJson(res, 500, {
-        ok: false,
-        error: {
-          code: "INTERNAL_ERROR",
-          message: "Internal server error",
-        },
+    if (!routeMatch) {
+      return;
+    }
+
+    try {
+      resolvedOptions.analyticsRecorder.recordApiAccess({
+        routeKey: routeMatch.routeKey,
+        statusCode: res.statusCode,
+        tokenId: routeMatch.tokenId,
+        countTokenVisit:
+          req.method === "GET" &&
+          routeMatch.routeKey === "tokens.detail" &&
+          res.statusCode === 200,
       });
+    } catch (error) {
+      resolvedOptions.logger.warn(
+        `analytics recording failed | route=${routeMatch.routeKey} status=${res.statusCode} error=${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   };
 }

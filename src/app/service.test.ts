@@ -51,6 +51,7 @@ const BASE_CONFIG: AppConfig = {
   bootstrapConcurrency: 1,
   apiPageSizeDefault: 50,
   apiPageSizeMax: 200,
+  analyticsHourlyRetentionHours: 90 * 24,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
@@ -640,6 +641,160 @@ test("service exposes latest price and rolling stats in token list and detail vi
     assert.equal(singleTradeToken?.summary.latestPriceNanosatsPerAtom, "100");
     assert.equal(singleTradeToken?.summary.recent144PriceChangeBps, "0");
     assert.equal(singleTradeToken?.summary.recent144PriceChangePct, "0.00");
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("service exposes token visit stats and analytics queries", () => {
+  const db = openDatabase(":memory:");
+  const nowMs = Date.now();
+  const oneHourMs = 60 * 60 * 1000;
+
+  db.upsertTrackedToken({
+    tokenId: "token-a",
+    groupHex: "46token-a",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.upsertTrackedToken({
+    tokenId: "token-b",
+    groupHex: "46token-b",
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady("token-a", true, nowMs);
+  db.markTokenReady("token-b", true, nowMs);
+  db.recordApiAccess({
+    routeKey: "tokens.detail",
+    statusCode: 200,
+    tokenId: "token-a",
+    countTokenVisit: true,
+    occurredAtMs: nowMs,
+  });
+  db.recordApiAccess({
+    routeKey: "tokens.detail",
+    statusCode: 200,
+    tokenId: "token-a",
+    countTokenVisit: true,
+    occurredAtMs: nowMs - 30 * oneHourMs,
+  });
+  db.recordApiAccess({
+    routeKey: "tokens.detail",
+    statusCode: 200,
+    tokenId: "token-b",
+    countTokenVisit: true,
+    occurredAtMs: nowMs - oneHourMs,
+  });
+  db.recordApiAccess({
+    routeKey: "tokens.list",
+    statusCode: 400,
+    occurredAtMs: nowMs - oneHourMs,
+  });
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 5000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+    },
+  );
+
+  try {
+    const tokens = service.listTokens({
+      page: 1,
+      pageSize: 10,
+      readyOnly: true,
+    });
+    assert.deepEqual(tokens.items.slice(0, 2).map((item) => ({
+      tokenId: item.tokenId,
+      visitCountTotal: item.visitCountTotal,
+      visitCount24h: item.visitCount24h,
+    })), [
+      {
+        tokenId: "token-a",
+        visitCountTotal: 2,
+        visitCount24h: 1,
+      },
+      {
+        tokenId: "token-b",
+        visitCountTotal: 1,
+        visitCount24h: 1,
+      },
+    ]);
+
+    const tokenA = service.getToken("token-a");
+    assert.equal(tokenA?.summary.visitCountTotal, 2);
+    assert.equal(tokenA?.summary.visitCount24h, 1);
+    assert.equal(tokenA?.summary.lastVisitedAt, nowMs);
+
+    const summary = service.getAnalyticsSummary(48);
+    assert.equal(summary.apiAccessCountTotal, 4);
+    assert.equal(summary.tokenVisitCountTotal, 3);
+    assert.equal(summary.apiAccessBuckets.length, 48);
+
+    const endpoint = service.getEndpointAnalytics("tokens.detail", 48);
+    assert.equal(endpoint.accessCountTotal, 3);
+    assert.equal(endpoint.successCountTotal, 3);
+    assert.equal(endpoint.buckets.length, 48);
+
+    const visits = service.listTokenVisits({
+      page: 1,
+      pageSize: 10,
+      sort: "visitsTotal",
+      order: "desc",
+    });
+    assert.deepEqual(visits.items.slice(0, 2), [
+      {
+        tokenId: "token-a",
+        visitCountTotal: 2,
+        visitCount24h: 1,
+        lastVisitedAt: nowMs,
+      },
+      {
+        tokenId: "token-b",
+        visitCountTotal: 1,
+        visitCount24h: 1,
+        lastVisitedAt: nowMs - oneHourMs,
+      },
+    ]);
+
+    const tokenAnalytics = service.getTokenVisitAnalytics("token-a", 48);
+    assert.equal(tokenAnalytics?.visitCountTotal, 2);
+    assert.equal(tokenAnalytics?.visitCount24h, 1);
+    assert.equal(tokenAnalytics?.visitCountWindow, 2);
+    assert.equal(tokenAnalytics?.buckets.length, 48);
+
+    assert.equal(service.getTokenVisitAnalytics("token-missing", 48), null);
   } finally {
     service.stop();
     db.close();

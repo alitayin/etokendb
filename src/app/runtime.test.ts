@@ -25,6 +25,7 @@ const BASE_CONFIG: AppConfig = {
   bootstrapConcurrency: 1,
   apiPageSizeDefault: 50,
   apiPageSizeMax: 200,
+  analyticsHourlyRetentionHours: 90 * 24,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
@@ -73,6 +74,58 @@ function makeService() {
       total: 0,
       items: [],
     }),
+    listTokenCandles: (_tokenId: string, query: { interval: string; limit: number }) => ({
+      tokenId: "token-1",
+      interval: query.interval,
+      timezone: "Asia/Shanghai",
+      items: [],
+    }),
+    getAnalyticsSummary: (hours: number) => ({
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      apiAccessCountTotal: 0,
+      apiAccessCountWindow: 0,
+      apiAccessBuckets: [],
+      tokenVisitCountTotal: 0,
+      tokenVisitCountWindow: 0,
+      tokenVisitBuckets: [],
+    }),
+    listEndpointAnalytics: () => [],
+    getEndpointAnalytics: (_routeKey: string, hours: number) => ({
+      routeKey: "status" as const,
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      accessCountTotal: 0,
+      accessCountWindow: 0,
+      successCountTotal: 0,
+      successCountWindow: 0,
+      clientErrorCountTotal: 0,
+      clientErrorCountWindow: 0,
+      serverErrorCountTotal: 0,
+      serverErrorCountWindow: 0,
+      lastAccessedAt: null,
+      buckets: [],
+    }),
+    listTokenVisits: (query: { page: number; pageSize: number }) => ({
+      page: query.page,
+      pageSize: query.pageSize,
+      total: 0,
+      items: [],
+    }),
+    getTokenVisitAnalytics: (_tokenId: string, hours: number) => ({
+      tokenId: "token-1",
+      hours,
+      windowStart: 0,
+      windowEnd: 0,
+      visitCountTotal: 0,
+      visitCount24h: 0,
+      visitCountWindow: 0,
+      lastVisitedAt: null,
+      buckets: [],
+    }),
+    recordApiAccess: () => {},
   };
 }
 
@@ -154,4 +207,6 @@ test("toApiDataService exposes the service read surface", () => {
   assert.equal(api.isReady(), true);
   assert.equal(api.getStatus().readyTokenCount, 1);
   assert.deepEqual(api.listTokens({ page: 1, pageSize: 50 }).items, []);
+  assert.deepEqual(api.listTokenCandles("token-1", { interval: "hour", limit: 1 }).items, []);
+  assert.equal(api.getAnalyticsSummary(24).hours, 24);
 });

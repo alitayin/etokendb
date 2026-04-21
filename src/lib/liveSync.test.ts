@@ -19,6 +19,7 @@ const BASE_CONFIG: AppConfig = {
   bootstrapConcurrency: 2,
   apiPageSizeDefault: 50,
   apiPageSizeMax: 200,
+  analyticsHourlyRetentionHours: 90 * 24,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,

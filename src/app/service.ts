@@ -9,11 +9,20 @@ import {
   type SyncDependencies,
   type SyncProgressHandlers,
 } from "../lib/agoraSync.js";
+import {
+  ANALYTICS_PRUNE_INTERVAL_MS,
+  type AnalyticsRouteKey,
+  type ApiAccessRecord,
+  previousHoursWindowStartMs,
+} from "../lib/analytics.js";
 import { retryAsync, withTimeout } from "../lib/async.js";
 import type { AppConfig } from "../lib/config.js";
 import type { AppDatabase } from "../lib/db.js";
 import type { ActiveTokenSeed } from "../lib/types.js";
 import type {
+  AnalyticsSummary,
+  EndpointAnalyticsDetail,
+  EndpointAnalyticsSummary,
   TokenCandle,
   TokenCandlesResult,
   TokenCandleQuery,
@@ -24,6 +33,9 @@ import type {
   TokenListQuery,
   TokenSortField,
   TokenSummary,
+  TokenVisitAnalytics,
+  TokenVisitListQuery,
+  TokenVisitSummary,
   TradeHistoryItem,
   TradeListQuery,
 } from "./contracts.js";
@@ -210,6 +222,12 @@ function toTokenSummary(row: Record<string, unknown>): TokenSummary {
       row.last_ws_event_at === null || row.last_ws_event_at === undefined
         ? null
         : Number(row.last_ws_event_at),
+    visitCountTotal: Number(row.visit_count_total ?? 0),
+    visitCount24h: Number(row.visit_count_24h ?? 0),
+    lastVisitedAt:
+      row.last_visited_at === null || row.last_visited_at === undefined
+        ? null
+        : Number(row.last_visited_at),
   };
 }
 
@@ -283,6 +301,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private discoveryTimer: NodeJS.Timeout | null = null;
   private tipRefreshTimer: NodeJS.Timeout | null = null;
   private pollingTailTimer: NodeJS.Timeout | null = null;
+  private analyticsPruneTimer: NodeJS.Timeout | null = null;
   private workerCount = 0;
   private startedAt = Date.now();
   private phase: ServiceStatus["phase"] = "starting";
@@ -320,6 +339,7 @@ export class AgoraTokenService implements ServiceReadApi {
     this.bootstrapError = null;
 
     try {
+      await this.pruneOldAnalyticsBuckets("startup");
       await this.refreshTipHeight();
       await this.startWs();
       await this.bootstrap();
@@ -347,6 +367,10 @@ export class AgoraTokenService implements ServiceReadApi {
     if (this.pollingTailTimer) {
       clearInterval(this.pollingTailTimer);
       this.pollingTailTimer = null;
+    }
+    if (this.analyticsPruneTimer) {
+      clearInterval(this.analyticsPruneTimer);
+      this.analyticsPruneTimer = null;
     }
     if (this.ws) {
       this.ws.close();
@@ -411,6 +435,7 @@ export class AgoraTokenService implements ServiceReadApi {
       this.config,
     );
     const readyOnly = query.readyOnly ?? true;
+    const visit24hWindowStart = previousHoursWindowStartMs(Date.now(), 24);
     const totalRow = this.db.sqlite
       .prepare(
         `
@@ -432,6 +457,9 @@ export class AgoraTokenService implements ServiceReadApi {
             t.bootstrap_cohort,
             t.last_synced_at,
             t.last_ws_event_at,
+            COALESCE(v.visit_count_total, 0) AS visit_count_total,
+            COALESCE(v24.visit_count_24h, 0) AS visit_count_24h,
+            v.last_visited_at,
             s.trade_count,
             s.cumulative_paid_sats,
             s.last_trade_price_nanosats_per_atom,
@@ -447,13 +475,24 @@ export class AgoraTokenService implements ServiceReadApi {
           FROM tracked_tokens t
           LEFT JOIN token_stats s
             ON s.token_id = t.token_id
+          LEFT JOIN token_visit_totals v
+            ON v.token_id = t.token_id
+          LEFT JOIN (
+            SELECT
+              token_id,
+              SUM(visit_count) AS visit_count_24h
+            FROM token_visit_hourly
+            WHERE bucket_start >= ?
+            GROUP BY token_id
+          ) v24
+            ON v24.token_id = t.token_id
           ${readyOnly ? "WHERE COALESCE(t.is_ready, 0) = 1" : ""}
           ORDER BY ${tokenSortSql(query.sort ?? "recent144VolumeSats", query.order ?? "desc")}
           LIMIT ?
           OFFSET ?
         `,
       )
-      .all(pageSize, offset) as Record<string, unknown>[];
+      .all(visit24hWindowStart, pageSize, offset) as Record<string, unknown>[];
 
     return {
       page,
@@ -464,6 +503,7 @@ export class AgoraTokenService implements ServiceReadApi {
   }
 
   getToken(tokenId: string): TokenDetail | null {
+    const visit24hWindowStart = previousHoursWindowStartMs(Date.now(), 24);
     const row = this.db.sqlite
       .prepare(
         `
@@ -477,6 +517,9 @@ export class AgoraTokenService implements ServiceReadApi {
             t.init_status,
             t.last_synced_at,
             t.last_ws_event_at,
+            COALESCE(v.visit_count_total, 0) AS visit_count_total,
+            COALESCE(v24.visit_count_24h, 0) AS visit_count_24h,
+            v.last_visited_at,
             s.trade_count,
             s.cumulative_paid_sats,
             s.last_trade_price_nanosats_per_atom,
@@ -492,10 +535,21 @@ export class AgoraTokenService implements ServiceReadApi {
           FROM tracked_tokens t
           LEFT JOIN token_stats s
             ON s.token_id = t.token_id
+          LEFT JOIN token_visit_totals v
+            ON v.token_id = t.token_id
+          LEFT JOIN (
+            SELECT
+              token_id,
+              SUM(visit_count) AS visit_count_24h
+            FROM token_visit_hourly
+            WHERE bucket_start >= ?
+            GROUP BY token_id
+          ) v24
+            ON v24.token_id = t.token_id
           WHERE t.token_id = ?
         `,
       )
-      .get(tokenId) as Record<string, unknown> | undefined;
+      .get(visit24hWindowStart, tokenId) as Record<string, unknown> | undefined;
     if (!row) {
       return null;
     }
@@ -506,6 +560,52 @@ export class AgoraTokenService implements ServiceReadApi {
       lastDiscoveredAt: Number(row.last_discovered_at),
       initStatus: String(row.init_status ?? "PENDING"),
     };
+  }
+
+  recordApiAccess(entry: ApiAccessRecord): void {
+    this.db.recordApiAccess(entry);
+  }
+
+  getAnalyticsSummary(hours: number): AnalyticsSummary {
+    return this.db.getAnalyticsSummary({ hours });
+  }
+
+  listEndpointAnalytics(hours: number): EndpointAnalyticsSummary[] {
+    return this.db.listEndpointAnalytics({ hours });
+  }
+
+  getEndpointAnalytics(
+    routeKey: AnalyticsRouteKey,
+    hours: number,
+  ): EndpointAnalyticsDetail {
+    return this.db.getEndpointAnalytics({ routeKey, hours });
+  }
+
+  listTokenVisits(
+    query: TokenVisitListQuery,
+  ): PaginatedResult<TokenVisitSummary> {
+    const { page, pageSize, offset } = normalizePagination(
+      query.page,
+      query.pageSize,
+      this.config,
+    );
+    return this.db.listTokenVisits({
+      page,
+      pageSize,
+      offset,
+      sort: query.sort,
+      order: query.order,
+    });
+  }
+
+  getTokenVisitAnalytics(
+    tokenId: string,
+    hours: number,
+  ): TokenVisitAnalytics | null {
+    if (!this.db.getTrackedToken(tokenId)) {
+      return null;
+    }
+    return this.db.getTokenVisitAnalytics({ tokenId, hours });
   }
 
   listTokenTrades(
@@ -588,6 +688,29 @@ export class AgoraTokenService implements ServiceReadApi {
         }
       }
     }, this.config.pollIntervalMs);
+
+    this.analyticsPruneTimer = setInterval(() => {
+      void this.pruneOldAnalyticsBuckets("background");
+    }, ANALYTICS_PRUNE_INTERVAL_MS);
+  }
+
+  private async pruneOldAnalyticsBuckets(
+    reason: "startup" | "background",
+  ): Promise<void> {
+    try {
+      const result = this.db.pruneOldAnalyticsBuckets(
+        this.config.analyticsHourlyRetentionHours,
+      );
+      if (result.apiRouteBucketCount > 0 || result.tokenVisitBucketCount > 0) {
+        this.logger.info(
+          `analytics prune completed | reason=${reason} api_route_buckets=${result.apiRouteBucketCount} token_visit_buckets=${result.tokenVisitBucketCount}`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `analytics prune failed | reason=${reason} error=${this.formatError(error)}`,
+      );
+    }
   }
 
   private async startWs(): Promise<void> {

@@ -3,6 +3,17 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import {
+  ANALYTICS_ROUTE_KEYS,
+  HOUR_MS,
+  type AnalyticsRouteKey,
+  type ApiAccessRecord,
+  getBucketEndMs,
+  getStatusCountDeltas,
+  previousHoursWindowStartMs,
+  retentionCutoffBucketStartMs,
+  startOfHourMs,
+} from "./analytics.js";
 import { computeRollingStatsSnapshot } from "./stats.js";
 import type {
   ActiveTokenSeed,
@@ -28,9 +39,89 @@ interface BucketDelta {
   volumeSatsDelta: bigint;
 }
 
+interface DbApiAccessBucket {
+  bucketStart: number;
+  bucketEnd: number;
+  accessCount: number;
+  successCount: number;
+  clientErrorCount: number;
+  serverErrorCount: number;
+}
+
+interface DbTokenVisitBucket {
+  bucketStart: number;
+  bucketEnd: number;
+  visitCount: number;
+}
+
+interface DbEndpointAnalyticsSummary {
+  routeKey: AnalyticsRouteKey;
+  accessCountTotal: number;
+  accessCountWindow: number;
+  successCountTotal: number;
+  successCountWindow: number;
+  clientErrorCountTotal: number;
+  clientErrorCountWindow: number;
+  serverErrorCountTotal: number;
+  serverErrorCountWindow: number;
+  lastAccessedAt: number | null;
+}
+
+interface DbEndpointAnalyticsDetail extends DbEndpointAnalyticsSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  buckets: DbApiAccessBucket[];
+}
+
+interface DbAnalyticsSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  apiAccessCountTotal: number;
+  apiAccessCountWindow: number;
+  apiAccessBuckets: DbApiAccessBucket[];
+  tokenVisitCountTotal: number;
+  tokenVisitCountWindow: number;
+  tokenVisitBuckets: DbTokenVisitBucket[];
+}
+
+type DbTokenVisitSortField = "visitsTotal" | "visits24h" | "lastVisitedAt";
+
+interface DbTokenVisitSummary {
+  tokenId: string;
+  visitCountTotal: number;
+  visitCount24h: number;
+  lastVisitedAt: number | null;
+}
+
+interface DbTokenVisitAnalytics extends DbTokenVisitSummary {
+  hours: number;
+  windowStart: number;
+  windowEnd: number;
+  visitCountWindow: number;
+  buckets: DbTokenVisitBucket[];
+}
+
+interface DbTokenVisitSnapshot {
+  visitCountTotal: number;
+  visitCount24h: number;
+  lastVisitedAt: number | null;
+}
+
+interface ListTokenVisitsOptions {
+  page: number;
+  pageSize: number;
+  offset: number;
+  sort?: DbTokenVisitSortField;
+  order?: "asc" | "desc";
+  nowMs?: number;
+}
+
 export interface AppDatabase {
   sqlite: Database.Database;
   close: () => void;
+  recordApiAccess: (entry: ApiAccessRecord) => void;
   markAllTrackedTokensInactive: () => void;
   upsertTrackedToken: (token: ActiveTokenSeed) => void;
   listTrackedTokenIds: () => string[];
@@ -59,6 +150,41 @@ export interface AppDatabase {
   listTokenStatsPage: (options: ListTokenStatsPageOptions) => TokenStatsPageRow[];
   listTradeHistory: (options: ListTradeHistoryOptions) => TradeHistoryRow[];
   listTokenCandles: (options: ListTokenCandlesOptions) => TokenCandleRow[];
+  getAnalyticsSummary: (options: {
+    hours: number;
+    nowMs?: number;
+  }) => DbAnalyticsSummary;
+  listEndpointAnalytics: (options: {
+    hours: number;
+    nowMs?: number;
+  }) => DbEndpointAnalyticsSummary[];
+  getEndpointAnalytics: (options: {
+    routeKey: AnalyticsRouteKey;
+    hours: number;
+    nowMs?: number;
+  }) => DbEndpointAnalyticsDetail;
+  listTokenVisits: (options: ListTokenVisitsOptions) => {
+    page: number;
+    pageSize: number;
+    total: number;
+    items: DbTokenVisitSummary[];
+  };
+  getTokenVisitAnalytics: (options: {
+    tokenId: string;
+    hours: number;
+    nowMs?: number;
+  }) => DbTokenVisitAnalytics;
+  getTokenVisitSnapshot: (
+    tokenId: string,
+    nowMs?: number,
+  ) => DbTokenVisitSnapshot;
+  pruneOldAnalyticsBuckets: (
+    retentionHours: number,
+    nowMs?: number,
+  ) => {
+    apiRouteBucketCount: number;
+    tokenVisitBucketCount: number;
+  };
 }
 
 const SHANGHAI_OFFSET_SECONDS = 8 * 60 * 60;
@@ -182,6 +308,49 @@ function createSchema(sqlite: Database.Database): void {
       last_trade_price_nanosats_per_atom TEXT,
       updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS api_route_access_totals (
+      route_key TEXT PRIMARY KEY,
+      access_count_total INTEGER NOT NULL DEFAULT 0,
+      success_count_total INTEGER NOT NULL DEFAULT 0,
+      client_error_count_total INTEGER NOT NULL DEFAULT 0,
+      server_error_count_total INTEGER NOT NULL DEFAULT 0,
+      last_accessed_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS api_route_access_hourly (
+      route_key TEXT NOT NULL,
+      bucket_start INTEGER NOT NULL,
+      access_count INTEGER NOT NULL DEFAULT 0,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      client_error_count INTEGER NOT NULL DEFAULT 0,
+      server_error_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (route_key, bucket_start)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_route_access_hourly_bucket_start
+      ON api_route_access_hourly (bucket_start);
+
+    CREATE TABLE IF NOT EXISTS token_visit_totals (
+      token_id TEXT PRIMARY KEY,
+      visit_count_total INTEGER NOT NULL DEFAULT 0,
+      last_visited_at INTEGER,
+      FOREIGN KEY (token_id) REFERENCES tracked_tokens(token_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_token_visit_totals_last_visited_at
+      ON token_visit_totals (last_visited_at);
+
+    CREATE TABLE IF NOT EXISTS token_visit_hourly (
+      token_id TEXT NOT NULL,
+      bucket_start INTEGER NOT NULL,
+      visit_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (token_id, bucket_start),
+      FOREIGN KEY (token_id) REFERENCES tracked_tokens(token_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_token_visit_hourly_bucket_start
+      ON token_visit_hourly (bucket_start);
   `);
 
   ensureColumn(sqlite, "tracked_tokens", "is_ready", "INTEGER NOT NULL DEFAULT 0");
@@ -249,6 +418,112 @@ function createSchema(sqlite: Database.Database): void {
     "last_trade_price_nanosats_per_atom",
     "TEXT",
   );
+}
+
+function toNullableNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
+function createEmptyApiAccessBucket(bucketStart: number): DbApiAccessBucket {
+  return {
+    bucketStart,
+    bucketEnd: getBucketEndMs(bucketStart),
+    accessCount: 0,
+    successCount: 0,
+    clientErrorCount: 0,
+    serverErrorCount: 0,
+  };
+}
+
+function createEmptyTokenVisitBucket(bucketStart: number): DbTokenVisitBucket {
+  return {
+    bucketStart,
+    bucketEnd: getBucketEndMs(bucketStart),
+    visitCount: 0,
+  };
+}
+
+function denseApiAccessBuckets(
+  rows: Array<Record<string, unknown>>,
+  windowStart: number,
+  hours: number,
+): DbApiAccessBucket[] {
+  const buckets = new Map<number, DbApiAccessBucket>();
+  for (const row of rows) {
+    const bucketStart = Number(row.bucket_start);
+    buckets.set(bucketStart, {
+      bucketStart,
+      bucketEnd: getBucketEndMs(bucketStart),
+      accessCount: Number(row.access_count ?? 0),
+      successCount: Number(row.success_count ?? 0),
+      clientErrorCount: Number(row.client_error_count ?? 0),
+      serverErrorCount: Number(row.server_error_count ?? 0),
+    });
+  }
+
+  const dense: DbApiAccessBucket[] = [];
+  for (let index = 0; index < hours; index += 1) {
+    const bucketStart = windowStart + index * HOUR_MS;
+    dense.push(buckets.get(bucketStart) ?? createEmptyApiAccessBucket(bucketStart));
+  }
+  return dense;
+}
+
+function denseTokenVisitBuckets(
+  rows: Array<Record<string, unknown>>,
+  windowStart: number,
+  hours: number,
+): DbTokenVisitBucket[] {
+  const buckets = new Map<number, DbTokenVisitBucket>();
+  for (const row of rows) {
+    const bucketStart = Number(row.bucket_start);
+    buckets.set(bucketStart, {
+      bucketStart,
+      bucketEnd: getBucketEndMs(bucketStart),
+      visitCount: Number(row.visit_count ?? 0),
+    });
+  }
+
+  const dense: DbTokenVisitBucket[] = [];
+  for (let index = 0; index < hours; index += 1) {
+    const bucketStart = windowStart + index * HOUR_MS;
+    dense.push(buckets.get(bucketStart) ?? createEmptyTokenVisitBucket(bucketStart));
+  }
+  return dense;
+}
+
+function emptyEndpointAnalyticsSummary(
+  routeKey: AnalyticsRouteKey,
+): DbEndpointAnalyticsSummary {
+  return {
+    routeKey,
+    accessCountTotal: 0,
+    accessCountWindow: 0,
+    successCountTotal: 0,
+    successCountWindow: 0,
+    clientErrorCountTotal: 0,
+    clientErrorCountWindow: 0,
+    serverErrorCountTotal: 0,
+    serverErrorCountWindow: 0,
+    lastAccessedAt: null,
+  };
+}
+
+function tokenVisitOrderByClause(
+  sort: DbTokenVisitSortField,
+  order: "asc" | "desc",
+): string {
+  const direction = order === "asc" ? "ASC" : "DESC";
+
+  switch (sort) {
+    case "visits24h":
+      return `COALESCE(v24.visit_count_24h, 0) ${direction}, COALESCE(v.last_visited_at, 0) ${direction}, t.token_id ASC`;
+    case "lastVisitedAt":
+      return `CASE WHEN v.last_visited_at IS NULL THEN 1 ELSE 0 END ASC, COALESCE(v.last_visited_at, 0) ${direction}, t.token_id ASC`;
+    case "visitsTotal":
+    default:
+      return `COALESCE(v.visit_count_total, 0) ${direction}, COALESCE(v.last_visited_at, 0) ${direction}, t.token_id ASC`;
+  }
 }
 
 function normalizeInitStatus(value: string | null | undefined): TokenInitStatus {
@@ -1145,6 +1420,212 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     );
   }
 
+  const upsertApiRouteAccessTotalStmt = sqlite.prepare(`
+    INSERT INTO api_route_access_totals (
+      route_key,
+      access_count_total,
+      success_count_total,
+      client_error_count_total,
+      server_error_count_total,
+      last_accessed_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(route_key) DO UPDATE SET
+      access_count_total = api_route_access_totals.access_count_total + excluded.access_count_total,
+      success_count_total = api_route_access_totals.success_count_total + excluded.success_count_total,
+      client_error_count_total = api_route_access_totals.client_error_count_total + excluded.client_error_count_total,
+      server_error_count_total = api_route_access_totals.server_error_count_total + excluded.server_error_count_total,
+      last_accessed_at = CASE
+        WHEN api_route_access_totals.last_accessed_at IS NULL OR excluded.last_accessed_at > api_route_access_totals.last_accessed_at
+          THEN excluded.last_accessed_at
+        ELSE api_route_access_totals.last_accessed_at
+      END
+  `);
+
+  const upsertApiRouteAccessHourlyStmt = sqlite.prepare(`
+    INSERT INTO api_route_access_hourly (
+      route_key,
+      bucket_start,
+      access_count,
+      success_count,
+      client_error_count,
+      server_error_count
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(route_key, bucket_start) DO UPDATE SET
+      access_count = api_route_access_hourly.access_count + excluded.access_count,
+      success_count = api_route_access_hourly.success_count + excluded.success_count,
+      client_error_count = api_route_access_hourly.client_error_count + excluded.client_error_count,
+      server_error_count = api_route_access_hourly.server_error_count + excluded.server_error_count
+  `);
+
+  const upsertTokenVisitTotalStmt = sqlite.prepare(`
+    INSERT INTO token_visit_totals (
+      token_id,
+      visit_count_total,
+      last_visited_at
+    ) VALUES (?, ?, ?)
+    ON CONFLICT(token_id) DO UPDATE SET
+      visit_count_total = token_visit_totals.visit_count_total + excluded.visit_count_total,
+      last_visited_at = CASE
+        WHEN token_visit_totals.last_visited_at IS NULL OR excluded.last_visited_at > token_visit_totals.last_visited_at
+          THEN excluded.last_visited_at
+        ELSE token_visit_totals.last_visited_at
+      END
+  `);
+
+  const upsertTokenVisitHourlyStmt = sqlite.prepare(`
+    INSERT INTO token_visit_hourly (
+      token_id,
+      bucket_start,
+      visit_count
+    ) VALUES (?, ?, ?)
+    ON CONFLICT(token_id, bucket_start) DO UPDATE SET
+      visit_count = token_visit_hourly.visit_count + excluded.visit_count
+  `);
+
+  const listApiRouteTotalsStmt = sqlite.prepare(`
+    SELECT
+      route_key,
+      access_count_total,
+      success_count_total,
+      client_error_count_total,
+      server_error_count_total,
+      last_accessed_at
+    FROM api_route_access_totals
+  `);
+
+  const listApiRouteWindowTotalsStmt = sqlite.prepare(`
+    SELECT
+      route_key,
+      COALESCE(SUM(access_count), 0) AS access_count_window,
+      COALESCE(SUM(success_count), 0) AS success_count_window,
+      COALESCE(SUM(client_error_count), 0) AS client_error_count_window,
+      COALESCE(SUM(server_error_count), 0) AS server_error_count_window
+    FROM api_route_access_hourly
+    WHERE bucket_start >= ?
+    GROUP BY route_key
+  `);
+
+  const listApiRouteHourlyByRouteStmt = sqlite.prepare(`
+    SELECT
+      bucket_start,
+      access_count,
+      success_count,
+      client_error_count,
+      server_error_count
+    FROM api_route_access_hourly
+    WHERE route_key = ?
+      AND bucket_start >= ?
+    ORDER BY bucket_start ASC
+  `);
+
+  const listApiRouteHourlyGlobalStmt = sqlite.prepare(`
+    SELECT
+      bucket_start,
+      COALESCE(SUM(access_count), 0) AS access_count,
+      COALESCE(SUM(success_count), 0) AS success_count,
+      COALESCE(SUM(client_error_count), 0) AS client_error_count,
+      COALESCE(SUM(server_error_count), 0) AS server_error_count
+    FROM api_route_access_hourly
+    WHERE bucket_start >= ?
+    GROUP BY bucket_start
+    ORDER BY bucket_start ASC
+  `);
+
+  const getApiAccessTotalsSummaryStmt = sqlite.prepare(`
+    SELECT
+      COALESCE(SUM(access_count_total), 0) AS access_count_total,
+      COALESCE(SUM(success_count_total), 0) AS success_count_total,
+      COALESCE(SUM(client_error_count_total), 0) AS client_error_count_total,
+      COALESCE(SUM(server_error_count_total), 0) AS server_error_count_total
+    FROM api_route_access_totals
+  `);
+
+  const getTokenVisitTotalsSummaryStmt = sqlite.prepare(`
+    SELECT
+      COALESCE(SUM(visit_count_total), 0) AS visit_count_total
+    FROM token_visit_totals
+  `);
+
+  const listTokenVisitHourlyGlobalStmt = sqlite.prepare(`
+    SELECT
+      bucket_start,
+      COALESCE(SUM(visit_count), 0) AS visit_count
+    FROM token_visit_hourly
+    WHERE bucket_start >= ?
+    GROUP BY bucket_start
+    ORDER BY bucket_start ASC
+  `);
+
+  const countTrackedTokensStmt = sqlite.prepare(`
+    SELECT COUNT(*) AS count
+    FROM tracked_tokens
+  `);
+
+  const getTokenVisitSnapshotStmt = sqlite.prepare(`
+    SELECT
+      COALESCE(v.visit_count_total, 0) AS visit_count_total,
+      v.last_visited_at,
+      COALESCE((
+        SELECT SUM(h.visit_count)
+        FROM token_visit_hourly h
+        WHERE h.token_id = t.token_id
+          AND h.bucket_start >= ?
+      ), 0) AS visit_count_24h
+    FROM tracked_tokens t
+    LEFT JOIN token_visit_totals v
+      ON v.token_id = t.token_id
+    WHERE t.token_id = ?
+  `);
+
+  const listTokenVisitHourlyByTokenStmt = sqlite.prepare(`
+    SELECT
+      bucket_start,
+      visit_count
+    FROM token_visit_hourly
+    WHERE token_id = ?
+      AND bucket_start >= ?
+    ORDER BY bucket_start ASC
+  `);
+
+  const deleteOldApiRouteBucketsStmt = sqlite.prepare(`
+    DELETE FROM api_route_access_hourly
+    WHERE bucket_start < ?
+  `);
+
+  const deleteOldTokenVisitBucketsStmt = sqlite.prepare(`
+    DELETE FROM token_visit_hourly
+    WHERE bucket_start < ?
+  `);
+
+  const recordApiAccessTx = sqlite.transaction((entry: ApiAccessRecord) => {
+    const occurredAtMs = entry.occurredAtMs ?? Date.now();
+    const bucketStart = startOfHourMs(occurredAtMs);
+    const { successDelta, clientErrorDelta, serverErrorDelta } =
+      getStatusCountDeltas(entry.statusCode);
+
+    upsertApiRouteAccessTotalStmt.run(
+      entry.routeKey,
+      1,
+      successDelta,
+      clientErrorDelta,
+      serverErrorDelta,
+      occurredAtMs,
+    );
+    upsertApiRouteAccessHourlyStmt.run(
+      entry.routeKey,
+      bucketStart,
+      1,
+      successDelta,
+      clientErrorDelta,
+      serverErrorDelta,
+    );
+
+    if (entry.countTokenVisit && entry.tokenId) {
+      upsertTokenVisitTotalStmt.run(entry.tokenId, 1, occurredAtMs);
+      upsertTokenVisitHourlyStmt.run(entry.tokenId, bucketStart, 1);
+    }
+  });
+
   const setBootstrapCohortTx = sqlite.transaction((tokenIds: string[]) => {
     resetBootstrapStmt.run();
     for (const tokenId of tokenIds) {
@@ -1281,9 +1762,208 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     },
   );
 
+  function readEndpointAnalyticsSummary(
+    hours: number,
+    nowMs = Date.now(),
+  ): DbEndpointAnalyticsSummary[] {
+    const windowStart = previousHoursWindowStartMs(nowMs, hours);
+    const summaries = new Map<AnalyticsRouteKey, DbEndpointAnalyticsSummary>(
+      ANALYTICS_ROUTE_KEYS.map((routeKey) => [
+        routeKey,
+        emptyEndpointAnalyticsSummary(routeKey),
+      ]),
+    );
+
+    const totalRows = listApiRouteTotalsStmt.all() as Array<Record<string, unknown>>;
+    for (const row of totalRows) {
+      const routeKey = row.route_key as AnalyticsRouteKey;
+      const existing = summaries.get(routeKey);
+      if (!existing) {
+        continue;
+      }
+      summaries.set(routeKey, {
+        ...existing,
+        accessCountTotal: Number(row.access_count_total ?? 0),
+        successCountTotal: Number(row.success_count_total ?? 0),
+        clientErrorCountTotal: Number(row.client_error_count_total ?? 0),
+        serverErrorCountTotal: Number(row.server_error_count_total ?? 0),
+        lastAccessedAt: toNullableNumber(row.last_accessed_at),
+      });
+    }
+
+    const windowRows = listApiRouteWindowTotalsStmt.all(windowStart) as Array<
+      Record<string, unknown>
+    >;
+    for (const row of windowRows) {
+      const routeKey = row.route_key as AnalyticsRouteKey;
+      const existing = summaries.get(routeKey);
+      if (!existing) {
+        continue;
+      }
+      summaries.set(routeKey, {
+        ...existing,
+        accessCountWindow: Number(row.access_count_window ?? 0),
+        successCountWindow: Number(row.success_count_window ?? 0),
+        clientErrorCountWindow: Number(row.client_error_count_window ?? 0),
+        serverErrorCountWindow: Number(row.server_error_count_window ?? 0),
+      });
+    }
+
+    return ANALYTICS_ROUTE_KEYS.map(
+      (routeKey) => summaries.get(routeKey) ?? emptyEndpointAnalyticsSummary(routeKey),
+    );
+  }
+
+  function readTokenVisitSnapshot(
+    tokenId: string,
+    nowMs = Date.now(),
+  ): DbTokenVisitSnapshot {
+    const visit24hWindowStart = previousHoursWindowStartMs(nowMs, 24);
+    const row = getTokenVisitSnapshotStmt.get(visit24hWindowStart, tokenId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      return {
+        visitCountTotal: 0,
+        visitCount24h: 0,
+        lastVisitedAt: null,
+      };
+    }
+
+    return {
+      visitCountTotal: Number(row.visit_count_total ?? 0),
+      visitCount24h: Number(row.visit_count_24h ?? 0),
+      lastVisitedAt: toNullableNumber(row.last_visited_at),
+    };
+  }
+
+  function readTokenVisitAnalytics(
+    tokenId: string,
+    hours: number,
+    nowMs = Date.now(),
+  ): DbTokenVisitAnalytics {
+    const windowStart = previousHoursWindowStartMs(nowMs, hours);
+    const snapshot = readTokenVisitSnapshot(tokenId, nowMs);
+    const rows = listTokenVisitHourlyByTokenStmt.all(
+      tokenId,
+      windowStart,
+    ) as Array<Record<string, unknown>>;
+    const buckets = denseTokenVisitBuckets(rows, windowStart, hours);
+
+    return {
+      tokenId,
+      ...snapshot,
+      hours,
+      windowStart,
+      windowEnd: nowMs,
+      visitCountWindow: buckets.reduce(
+        (total, bucket) => total + bucket.visitCount,
+        0,
+      ),
+      buckets,
+    };
+  }
+
+  function readAnalyticsSummary(
+    hours: number,
+    nowMs = Date.now(),
+  ): DbAnalyticsSummary {
+    const windowStart = previousHoursWindowStartMs(nowMs, hours);
+    const apiTotalsRow = getApiAccessTotalsSummaryStmt.get() as Record<string, unknown>;
+    const apiHourlyRows = listApiRouteHourlyGlobalStmt.all(
+      windowStart,
+    ) as Array<Record<string, unknown>>;
+    const apiAccessBuckets = denseApiAccessBuckets(apiHourlyRows, windowStart, hours);
+    const tokenVisitTotalsRow = getTokenVisitTotalsSummaryStmt.get() as Record<
+      string,
+      unknown
+    >;
+    const tokenVisitHourlyRows = listTokenVisitHourlyGlobalStmt.all(
+      windowStart,
+    ) as Array<Record<string, unknown>>;
+    const tokenVisitBuckets = denseTokenVisitBuckets(
+      tokenVisitHourlyRows,
+      windowStart,
+      hours,
+    );
+
+    return {
+      hours,
+      windowStart,
+      windowEnd: nowMs,
+      apiAccessCountTotal: Number(apiTotalsRow.access_count_total ?? 0),
+      apiAccessCountWindow: apiAccessBuckets.reduce(
+        (total, bucket) => total + bucket.accessCount,
+        0,
+      ),
+      apiAccessBuckets,
+      tokenVisitCountTotal: Number(tokenVisitTotalsRow.visit_count_total ?? 0),
+      tokenVisitCountWindow: tokenVisitBuckets.reduce(
+        (total, bucket) => total + bucket.visitCount,
+        0,
+      ),
+      tokenVisitBuckets,
+    };
+  }
+
+  function readTokenVisitsPage(options: ListTokenVisitsOptions): {
+    page: number;
+    pageSize: number;
+    total: number;
+    items: DbTokenVisitSummary[];
+  } {
+    const sort = options.sort ?? "visitsTotal";
+    const order = options.order ?? "desc";
+    const nowMs = options.nowMs ?? Date.now();
+    const visit24hWindowStart = previousHoursWindowStartMs(nowMs, 24);
+    const orderBy = tokenVisitOrderByClause(sort, order);
+    const stmt = sqlite.prepare(`
+      SELECT
+        t.token_id,
+        COALESCE(v.visit_count_total, 0) AS visit_count_total,
+        COALESCE(v24.visit_count_24h, 0) AS visit_count_24h,
+        v.last_visited_at
+      FROM tracked_tokens t
+      LEFT JOIN token_visit_totals v
+        ON v.token_id = t.token_id
+      LEFT JOIN (
+        SELECT
+          token_id,
+          SUM(visit_count) AS visit_count_24h
+        FROM token_visit_hourly
+        WHERE bucket_start >= ?
+        GROUP BY token_id
+      ) v24
+        ON v24.token_id = t.token_id
+      ORDER BY ${orderBy}
+      LIMIT ? OFFSET ?
+    `);
+    const totalRow = countTrackedTokensStmt.get() as { count: number };
+    const rows = stmt.all(
+      visit24hWindowStart,
+      options.pageSize,
+      options.offset,
+    ) as Array<Record<string, unknown>>;
+
+    return {
+      page: options.page,
+      pageSize: options.pageSize,
+      total: totalRow.count,
+      items: rows.map((row) => ({
+        tokenId: String(row.token_id),
+        visitCountTotal: Number(row.visit_count_total ?? 0),
+        visitCount24h: Number(row.visit_count_24h ?? 0),
+        lastVisitedAt: toNullableNumber(row.last_visited_at),
+      })),
+    };
+  }
+
   return {
     sqlite,
     close: () => sqlite.close(),
+    recordApiAccess: (entry) => {
+      recordApiAccessTx(entry);
+    },
     markAllTrackedTokensInactive: () => {
       markAllTrackedTokensInactiveStmt.run();
     },
@@ -1471,6 +2151,45 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       return (
         stmt.all(options.tokenId, options.limit) as Array<Record<string, unknown>>
       ).map(toTokenCandleRow);
+    },
+    getAnalyticsSummary: (options) =>
+      readAnalyticsSummary(options.hours, options.nowMs),
+    listEndpointAnalytics: (options) =>
+      readEndpointAnalyticsSummary(options.hours, options.nowMs),
+    getEndpointAnalytics: (options) => {
+      const nowMs = options.nowMs ?? Date.now();
+      const summary = readEndpointAnalyticsSummary(
+        options.hours,
+        nowMs,
+      ).find((item) => item.routeKey === options.routeKey) ??
+        emptyEndpointAnalyticsSummary(options.routeKey);
+      const windowStart = previousHoursWindowStartMs(nowMs, options.hours);
+      const rows = listApiRouteHourlyByRouteStmt.all(
+        options.routeKey,
+        windowStart,
+      ) as Array<Record<string, unknown>>;
+
+      return {
+        ...summary,
+        hours: options.hours,
+        windowStart,
+        windowEnd: nowMs,
+        buckets: denseApiAccessBuckets(rows, windowStart, options.hours),
+      };
+    },
+    listTokenVisits: (options) => readTokenVisitsPage(options),
+    getTokenVisitAnalytics: (options) =>
+      readTokenVisitAnalytics(options.tokenId, options.hours, options.nowMs),
+    getTokenVisitSnapshot: (tokenId, nowMs) =>
+      readTokenVisitSnapshot(tokenId, nowMs),
+    pruneOldAnalyticsBuckets: (retentionHours, nowMs = Date.now()) => {
+      const cutoffBucketStart = retentionCutoffBucketStartMs(nowMs, retentionHours);
+      return {
+        apiRouteBucketCount: deleteOldApiRouteBucketsStmt.run(cutoffBucketStart)
+          .changes,
+        tokenVisitBucketCount: deleteOldTokenVisitBucketsStmt.run(cutoffBucketStart)
+          .changes,
+      };
     },
   };
 }

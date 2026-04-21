@@ -25,7 +25,15 @@ export function toApiDataService(service: AgoraTokenService): ApiDataService {
     getStatus: () => service.getStatus(),
     listTokens: (query) => service.listTokens(query),
     getToken: (tokenId) => service.getToken(tokenId),
+    getAnalyticsSummary: (hours) => service.getAnalyticsSummary(hours),
+    listEndpointAnalytics: (hours) => service.listEndpointAnalytics(hours),
+    getEndpointAnalytics: (routeKey, hours) =>
+      service.getEndpointAnalytics(routeKey, hours),
+    listTokenVisits: (query) => service.listTokenVisits(query),
+    getTokenVisitAnalytics: (tokenId, hours) =>
+      service.getTokenVisitAnalytics(tokenId, hours),
     listTokenTrades: (tokenId, query) => service.listTokenTrades(tokenId, query),
+    listTokenCandles: (tokenId, query) => service.listTokenCandles(tokenId, query),
     listTrades: (query) => service.listTrades(query),
   };
 }
@@ -72,6 +80,10 @@ export async function startApplication(
     ((dataService: ApiDataService) =>
       createApiServer(dataService, {
         maxPageSize: config.apiPageSizeMax,
+        maxAnalyticsHours: config.analyticsHourlyRetentionHours,
+        analyticsRecorder: {
+          recordApiAccess: (entry) => service.recordApiAccess(entry),
+        },
       }));
   const listenFn = options.listen ?? listenServer;
   const closeServerFn = options.closeServer ?? closeServer;
