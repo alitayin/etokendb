@@ -35,6 +35,14 @@ export function toApiDataService(service: AgoraTokenService): ApiDataService {
     listTokenTrades: (tokenId, query) => service.listTokenTrades(tokenId, query),
     listTokenCandles: (tokenId, query) => service.listTokenCandles(tokenId, query),
     listTrades: (query) => service.listTrades(query),
+    listTokenReviews: (tokenId, query) =>
+      service.listTokenReviews(tokenId, query),
+    getTokenReviewSummary: (tokenId) => service.getTokenReviewSummary(tokenId),
+    createReviewInvoice: (tokenId, input) =>
+      service.createReviewInvoice(tokenId, input),
+    getReviewInvoice: (invoiceId) => service.getReviewInvoice(invoiceId),
+    submitReviewInvoiceTx: (invoiceId, input) =>
+      service.submitReviewInvoiceTx(invoiceId, input),
   };
 }
 

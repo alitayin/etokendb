@@ -910,3 +910,167 @@ test("openDatabase migrates legacy token_stats rows to include 30 day rolling co
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test("review invoices can be created for untracked token ids and expire", () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "a".repeat(64);
+
+  try {
+    const invoice = db.createReviewInvoice({
+      invoiceId: "invoice-1",
+      tokenId,
+      authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      score: 7,
+      commentText: "",
+      paymentAddress: "ecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd9f6zcr",
+      expectedPaidSats: 10_001_234,
+      verifierSats: 1_234,
+      expiresAt: 1_800_000,
+      createdAt: 1_000_000,
+    });
+
+    assert.equal(invoice.status, "pending");
+    assert.equal(invoice.expectedPaidSats, 10_001_234);
+    assert.equal(db.getReviewInvoice("invoice-1")?.tokenId, tokenId);
+    assert.equal(db.expireReviewInvoices(1_799_999), 0);
+    assert.equal(db.expireReviewInvoices(1_800_000), 1);
+    assert.equal(db.getReviewInvoice("invoice-1")?.status, "expired");
+  } finally {
+    db.close();
+  }
+});
+
+test("published token review summary uses each author's latest paid score", () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "b".repeat(64);
+  const authorA = "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";
+  const authorB = "ecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd9f6zcr";
+
+  function createAndPublish(params: {
+    invoiceId: string;
+    reviewId: string;
+    authorAddress: string;
+    score: number;
+    commentText: string;
+    txid: string;
+    createdAt: number;
+  }): void {
+    db.createReviewInvoice({
+      invoiceId: params.invoiceId,
+      tokenId,
+      authorAddress: params.authorAddress,
+      score: params.score,
+      commentText: params.commentText,
+      paymentAddress: authorB,
+      expectedPaidSats: 10_000_001,
+      verifierSats: 1,
+      expiresAt: params.createdAt + 1_000,
+      createdAt: params.createdAt - 100,
+    });
+    db.markReviewInvoiceTxSubmitted(
+      params.invoiceId,
+      params.txid,
+      params.createdAt,
+    );
+    db.publishTokenReview(
+      {
+        reviewId: params.reviewId,
+        invoiceId: params.invoiceId,
+        tokenId,
+        authorAddress: params.authorAddress,
+        score: params.score,
+        commentText: params.commentText,
+        paymentTxid: params.txid,
+        paidSats: 10_000_001,
+        paymentSeenAt: params.createdAt,
+        paymentBlockHeight: null,
+        paymentBlockTimestamp: null,
+        createdAt: params.createdAt,
+      },
+      params.createdAt,
+    );
+  }
+
+  try {
+    createAndPublish({
+      invoiceId: "invoice-old",
+      reviewId: "review-old",
+      authorAddress: authorA,
+      score: 3,
+      commentText: "old",
+      txid: "1".repeat(64),
+      createdAt: 2_000,
+    });
+    createAndPublish({
+      invoiceId: "invoice-other",
+      reviewId: "review-other",
+      authorAddress: authorB,
+      score: 5,
+      commentText: "ok",
+      txid: "2".repeat(64),
+      createdAt: 2_500,
+    });
+    createAndPublish({
+      invoiceId: "invoice-new",
+      reviewId: "review-new",
+      authorAddress: authorA,
+      score: 9,
+      commentText: "",
+      txid: "3".repeat(64),
+      createdAt: 3_000,
+    });
+
+    assert.deepEqual(db.getTokenReviewSummary(tokenId), {
+      averageScore: 7,
+      scorerCount: 2,
+      reviewCountTotal: 3,
+      commentCountTotal: 2,
+      lastReviewAt: 3_000,
+    });
+
+    const reviews = db.listTokenReviews({
+      tokenId,
+      page: 1,
+      pageSize: 10,
+      offset: 0,
+    });
+    assert.deepEqual(
+      reviews.items.map((review) => review.reviewId),
+      ["review-new", "review-other", "review-old"],
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice payment txids are unique", () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "c".repeat(64);
+  const authorAddress = "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";
+  const paymentAddress = "ecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd9f6zcr";
+  const txid = "4".repeat(64);
+
+  try {
+    for (const invoiceId of ["invoice-a", "invoice-b"]) {
+      db.createReviewInvoice({
+        invoiceId,
+        tokenId,
+        authorAddress,
+        score: 1,
+        commentText: "",
+        paymentAddress,
+        expectedPaidSats: 10_000_001,
+        verifierSats: 1,
+        expiresAt: 2_000,
+        createdAt: 1_000,
+      });
+    }
+
+    db.markReviewInvoiceTxSubmitted("invoice-a", txid, 1_100);
+    assert.throws(() =>
+      db.markReviewInvoiceTxSubmitted("invoice-b", txid, 1_200),
+    );
+  } finally {
+    db.close();
+  }
+});

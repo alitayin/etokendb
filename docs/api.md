@@ -11,7 +11,7 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 
 ## General behavior
 
-- All public endpoints are `GET` only.
+- Public endpoints are `GET` only except the review invoice routes documented below.
 - Unsupported methods return `405 METHOD_NOT_ALLOWED`.
 - Success responses use this envelope:
 
@@ -60,6 +60,14 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 - `TOKEN_NOT_FOUND`
 - `ROUTE_NOT_FOUND`
 - `ENDPOINT_DISABLED`
+- `INVALID_TOKEN_ID`
+- `INVALID_SCORE`
+- `COMMENT_TOO_LONG`
+- `INVALID_TXID`
+- `INVOICE_NOT_FOUND`
+- `INVOICE_EXPIRED`
+- `PAYMENT_TXID_REUSED`
+- `PAYMENT_OUTPUT_MISMATCH`
 - `METHOD_NOT_ALLOWED`
 - `NOT_FOUND`
 - `INTERNAL_ERROR`
@@ -75,6 +83,11 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 | `GET /api/tokens/:tokenId` | Single token detail |
 | `GET /api/tokens/:tokenId/trades` | Token trade history |
 | `GET /api/tokens/:tokenId/candles` | Token OHLCV candles |
+| `GET /api/tokens/:tokenId/reviews` | Paginated paid reviews |
+| `GET /api/tokens/:tokenId/reviews/summary` | Paid review score summary |
+| `POST /api/tokens/:tokenId/reviews/invoices` | Create a paid review invoice |
+| `GET /api/review-invoices/:invoiceId` | Review invoice detail |
+| `POST /api/review-invoices/:invoiceId/submit-tx` | Submit payment txid for verification |
 | `GET /api/trades` | Global trade history |
 | `GET /api/analytics/summary` | Site-wide access summary |
 | `GET /api/analytics/endpoints` | Access summary by endpoint |
@@ -216,6 +229,11 @@ Each token summary contains:
 - `visitCountTotal`
 - `visitCount24h`
 - `lastVisitedAt`
+- `reviewAverageScore`: number or `null` when no paid scores exist
+- `reviewScorerCount`: number of author addresses in the latest-score aggregate
+- `reviewCountTotal`: total published review records
+- `reviewCommentCountTotal`: total published review records with non-empty comments
+- `lastReviewAt`: Unix milliseconds or `null`
 
 Examples:
 
@@ -337,6 +355,113 @@ Example:
 curl "http://127.0.0.1:8787/api/tokens/<tokenId>/candles?interval=day&limit=30"
 ```
 
+## Paid reviews
+
+Paid reviews are append-only public records. A token does not need to be tracked by `etokendb`, but `tokenId` must be a 64-character hex string. Each published review has an integer `score` from `0` to `10`; `comment` is optional and limited to 500 UTF-8 bytes.
+
+Score aggregation uses only the latest published score per `(tokenId, authorAddress)`. Historical paid reviews remain visible in the review list.
+
+### `GET /api/tokens/:tokenId/reviews/summary`
+
+Returns the score and review totals for one token.
+
+Response `data`:
+
+- `averageScore`: number or `null` when no scores exist
+- `scorerCount`: number of author addresses in the latest-score aggregate
+- `reviewCountTotal`: total published review records
+- `commentCountTotal`: total published review records with non-empty comments
+- `lastReviewAt`: Unix milliseconds or `null`
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/summary"
+```
+
+### `GET /api/tokens/:tokenId/reviews`
+
+Returns the latest published review stream for one token.
+
+Query parameters:
+
+- `page`: integer, default `1`
+- `pageSize`: integer, default `50`, max `200`
+
+Each item contains:
+
+- `reviewId`
+- `tokenId`
+- `authorMasked`
+- `score`
+- `comment`
+- `createdAt`
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews?page=1&pageSize=20"
+```
+
+### `POST /api/tokens/:tokenId/reviews/invoices`
+
+Creates a pending invoice for one paid review. The response includes the configured payment address and exact amount to pay.
+
+Request body:
+
+- `authorAddress`: connected eCash address
+- `score`: integer from `0` to `10`
+- `comment`: optional string, max 500 UTF-8 bytes
+
+Response `data`:
+
+- `invoiceId`
+- `tokenId`
+- `authorAddress`
+- `score`
+- `comment`
+- `paymentAddress`
+- `expectedPaidSats`
+- `expectedPaidXec`
+- `status`
+- `expiresAt`
+- `paymentTxid`
+- `publishedReviewId`
+
+Example:
+
+```bash
+curl -X POST "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/invoices" \
+  -H "content-type: application/json" \
+  -d '{"authorAddress":"ecash:...","score":8,"comment":"optional"}'
+```
+
+### `GET /api/review-invoices/:invoiceId`
+
+Returns one invoice using the same response shape as invoice creation.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8787/api/review-invoices/<invoiceId>"
+```
+
+### `POST /api/review-invoices/:invoiceId/submit-tx`
+
+Submits a payment transaction id for verification. The transaction must spend at least one input from `authorAddress` and pay exactly `expectedPaidSats` to `paymentAddress`. Mempool transactions are accepted. If Chronik has not indexed the tx yet, the invoice remains `tx_submitted` and the background retry loop can publish it later.
+
+Request body:
+
+- `txid`: 64-character transaction id hex
+
+Example:
+
+```bash
+curl -X POST "http://127.0.0.1:8787/api/review-invoices/<invoiceId>/submit-tx" \
+  -H "content-type: application/json" \
+  -d '{"txid":"<txid>"}'
+```
+
 ## Trades
 
 ### `GET /api/trades`
@@ -378,6 +503,11 @@ Supported analytics `routeKey` values:
 - `tokens.detail`
 - `tokens.trades`
 - `tokens.candles`
+- `tokens.reviews.list`
+- `tokens.reviews.summary`
+- `tokens.review-invoices.create`
+- `review-invoices.detail`
+- `review-invoices.submit-tx`
 - `trades.list`
 
 The default analytics query window is `168` hours. The default retention window is `2160` hours, or 90 days. The maximum query window is capped by the deployment's `ANALYTICS_HOURLY_RETENTION_HOURS`.

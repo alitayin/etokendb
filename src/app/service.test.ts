@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { encodeOutputScript, getOutputScriptFromAddress } from "ecashaddrjs";
+
 import { openDatabase } from "../lib/db.js";
 import type { AppConfig } from "../lib/config.js";
+import { ReviewError } from "../lib/reviews.js";
 import { AgoraTokenService } from "./service.js";
 
 function makeProcessedTrade(params: {
@@ -52,10 +55,134 @@ const BASE_CONFIG: AppConfig = {
   apiPageSizeDefault: 50,
   apiPageSizeMax: 200,
   analyticsHourlyRetentionHours: 90 * 24,
+  reviewPaymentAddress: null,
+  reviewBaseFeeSats: 10_000_000,
+  reviewInvoiceTtlMs: 30 * 60 * 1000,
+  reviewRetryIntervalMs: 60 * 1000,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
 };
+
+const REVIEW_AUTHOR_ADDRESS =
+  "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";
+const REVIEW_PAYMENT_ADDRESS = REVIEW_AUTHOR_ADDRESS;
+const OTHER_REVIEW_ADDRESS = encodeOutputScript(
+  `76a914${"11".repeat(20)}88ac`,
+);
+const REVIEW_TOKEN_ID = "d".repeat(64);
+
+function makeTx(params: {
+  txid: string;
+  authorAddress?: string;
+  paymentAddress?: string;
+  paidSats?: bigint;
+  timeFirstSeen?: number;
+  blockHeight?: number;
+  blockTimestamp?: number;
+}) {
+  return {
+    txid: params.txid,
+    version: 2,
+    inputs: [
+      {
+        prevOut: { txid: "0".repeat(64), outIdx: 0 },
+        inputScript: "",
+        outputScript: getOutputScriptFromAddress(
+          params.authorAddress ?? REVIEW_AUTHOR_ADDRESS,
+        ),
+        sats: 100_000_000n,
+        sequenceNo: 0,
+      },
+    ],
+    outputs: [
+      {
+        outputScript: getOutputScriptFromAddress(
+          params.paymentAddress ?? REVIEW_PAYMENT_ADDRESS,
+        ),
+        sats: params.paidSats ?? 1_023n,
+      },
+    ],
+    lockTime: 0,
+    block:
+      params.blockHeight === undefined
+        ? undefined
+        : {
+            height: params.blockHeight,
+            hash: "block-hash",
+            timestamp: params.blockTimestamp ?? 0,
+          },
+    timeFirstSeen: params.timeFirstSeen ?? 0,
+    size: 100,
+    isCoinbase: false,
+    tokenEntries: [],
+    tokenFailedParsings: [],
+    tokenStatus: "TOKEN_STATUS_NORMAL",
+    isFinal: true,
+  } as never;
+}
+
+function makeReviewService(options: {
+  db?: ReturnType<typeof openDatabase>;
+  txs?: Map<string, unknown>;
+  nowMs?: () => number;
+} = {}) {
+  const db = options.db ?? openDatabase(":memory:");
+  const txs = options.txs ?? new Map<string, unknown>();
+  let invoiceCounter = 0;
+  let reviewCounter = 0;
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        plugin: () => ({}) as never,
+        tx: async (txid: string) => {
+          const tx = txs.get(txid);
+          if (!tx) {
+            throw new Error("tx not indexed");
+          }
+          return tx as never;
+        },
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 900_000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    {
+      ...BASE_CONFIG,
+      reviewPaymentAddress: REVIEW_PAYMENT_ADDRESS,
+      reviewBaseFeeSats: 1_000,
+      reviewInvoiceTtlMs: 1_000,
+    },
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+      nowMs: options.nowMs ?? (() => 10_000),
+      reviewInvoiceIdFactory: () => `invoice-${++invoiceCounter}`,
+      reviewIdFactory: () => `review-${++reviewCounter}`,
+      reviewVerifierSatsFactory: () => 23,
+    },
+  );
+  return { db, service, txs };
+}
 
 test("service performs tail catch-up before marking bootstrap token ready", async () => {
   const db = openDatabase(":memory:");
@@ -165,6 +292,357 @@ test("service performs tail catch-up before marking bootstrap token ready", asyn
     assert.equal(service.getStatus().phase, "ready");
   } finally {
     service.stop();
+    db.close();
+  }
+});
+
+test("review invoice submit publishes valid mempool payment tx", async () => {
+  const txid = "a".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(
+    txid,
+    makeTx({
+      txid,
+      paidSats: 1_023n,
+      timeFirstSeen: 123,
+    }),
+  );
+
+  try {
+    const invoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 8,
+      comment: "solid",
+    });
+
+    assert.equal(invoice.invoiceId, "invoice-1");
+    assert.equal(invoice.expectedPaidSats, 1_023);
+    assert.equal(invoice.expectedPaidXec, "10.23");
+
+    const submitted = await service.submitReviewInvoiceTx(invoice.invoiceId, {
+      txid,
+    });
+    assert.equal(submitted.status, "published");
+    assert.equal(submitted.paymentTxid, txid);
+    assert.equal(submitted.publishedReviewId, "review-1");
+
+    assert.deepEqual(service.getTokenReviewSummary(REVIEW_TOKEN_ID), {
+      averageScore: 8,
+      scorerCount: 1,
+      reviewCountTotal: 1,
+      commentCountTotal: 1,
+      lastReviewAt: 10_000,
+    });
+    assert.deepEqual(service.listTokenReviews(REVIEW_TOKEN_ID, { page: 1, pageSize: 10 }), {
+      page: 1,
+      pageSize: 10,
+      total: 1,
+      items: [
+        {
+          reviewId: "review-1",
+          tokenId: REVIEW_TOKEN_ID,
+          authorMasked: "ecash:q...kuu2",
+          score: 8,
+          comment: "solid",
+          createdAt: 10_000,
+        },
+      ],
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice submit stores tx_submitted until Chronik indexes tx", async () => {
+  const txid = "b".repeat(64);
+  const { db, service, txs } = makeReviewService();
+
+  try {
+    const invoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+    });
+    const pending = await service.submitReviewInvoiceTx(invoice.invoiceId, {
+      txid,
+    });
+    assert.equal(pending.status, "tx_submitted");
+    assert.equal(pending.paymentTxid, txid);
+
+    txs.set(txid, makeTx({ txid, paidSats: 1_023n }));
+    const retry = await service.retryPendingReviewPayments();
+    assert.deepEqual(retry, {
+      checked: 1,
+      published: 1,
+      invalid: 0,
+      expired: 0,
+    });
+    assert.equal(service.getReviewInvoice(invoice.invoiceId)?.status, "published");
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice submit rejects wrong payment amount and marks invoice invalid", async () => {
+  const txid = "c".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(txid, makeTx({ txid, paidSats: 1_024n }));
+
+  try {
+    const invoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+    });
+
+    await assert.rejects(
+      () => service.submitReviewInvoiceTx(invoice.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_OUTPUT_MISMATCH",
+    );
+    assert.equal(service.getReviewInvoice(invoice.invoiceId)?.status, "invalid");
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice submit rejects wrong payer and wrong recipient", async () => {
+  const wrongPayerTxid = "e".repeat(64);
+  const wrongRecipientTxid = "f".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(
+    wrongPayerTxid,
+    makeTx({
+      txid: wrongPayerTxid,
+      authorAddress: OTHER_REVIEW_ADDRESS,
+      paidSats: 1_023n,
+    }),
+  );
+  txs.set(
+    wrongRecipientTxid,
+    makeTx({
+      txid: wrongRecipientTxid,
+      paymentAddress: OTHER_REVIEW_ADDRESS,
+      paidSats: 1_023n,
+    }),
+  );
+
+  try {
+    const wrongPayerInvoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+    });
+    await assert.rejects(
+      () =>
+        service.submitReviewInvoiceTx(wrongPayerInvoice.invoiceId, {
+          txid: wrongPayerTxid,
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_AUTHOR_MISMATCH",
+    );
+    assert.equal(
+      service.getReviewInvoice(wrongPayerInvoice.invoiceId)?.status,
+      "invalid",
+    );
+
+    const wrongRecipientInvoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+    });
+    await assert.rejects(
+      () =>
+        service.submitReviewInvoiceTx(wrongRecipientInvoice.invoiceId, {
+          txid: wrongRecipientTxid,
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_OUTPUT_MISMATCH",
+    );
+    assert.equal(
+      service.getReviewInvoice(wrongRecipientInvoice.invoiceId)?.status,
+      "invalid",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice submit rejects expired invoices and duplicate txids", async () => {
+  let nowMs = 10_000;
+  const txid = "d".repeat(64);
+  const { db, service } = makeReviewService({
+    nowMs: () => nowMs,
+    txs: new Map(),
+  });
+
+  try {
+    const expired = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+    });
+    nowMs = 12_000;
+
+    await assert.rejects(
+      () => service.submitReviewInvoiceTx(expired.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError && error.code === "INVOICE_EXPIRED",
+    );
+    assert.equal(service.getReviewInvoice(expired.invoiceId)?.status, "expired");
+
+    nowMs = 20_000;
+    const first = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 7,
+    });
+    await service.submitReviewInvoiceTx(first.invoiceId, { txid });
+
+    const second = db.createReviewInvoice({
+      invoiceId: "invoice-manual",
+      tokenId: REVIEW_TOKEN_ID,
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 8,
+      commentText: "",
+      paymentAddress: REVIEW_PAYMENT_ADDRESS,
+      expectedPaidSats: 1_023,
+      verifierSats: 23,
+      expiresAt: 22_000,
+      createdAt: 20_000,
+    });
+    await assert.rejects(
+      () => service.submitReviewInvoiceTx(second.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError && error.code === "PAYMENT_TXID_REUSED",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("service includes review summary fields in token list and detail", () => {
+  const db = openDatabase(":memory:");
+  const serviceDeps = makeReviewService({ db }).service;
+  const tokenA = "review-token-a";
+  const tokenB = "review-token-b";
+  const authorA = REVIEW_AUTHOR_ADDRESS;
+  const authorB = OTHER_REVIEW_ADDRESS;
+
+  function publishReview(params: {
+    invoiceId: string;
+    reviewId: string;
+    tokenId: string;
+    authorAddress: string;
+    score: number;
+    commentText: string;
+    txid: string;
+    createdAt: number;
+  }): void {
+    db.createReviewInvoice({
+      invoiceId: params.invoiceId,
+      tokenId: params.tokenId,
+      authorAddress: params.authorAddress,
+      score: params.score,
+      commentText: params.commentText,
+      paymentAddress: REVIEW_PAYMENT_ADDRESS,
+      expectedPaidSats: 1_023,
+      verifierSats: 23,
+      expiresAt: params.createdAt + 1_000,
+      createdAt: params.createdAt - 100,
+    });
+    db.markReviewInvoiceTxSubmitted(
+      params.invoiceId,
+      params.txid,
+      params.createdAt,
+    );
+    db.publishTokenReview(
+      {
+        reviewId: params.reviewId,
+        invoiceId: params.invoiceId,
+        tokenId: params.tokenId,
+        authorAddress: params.authorAddress,
+        score: params.score,
+        commentText: params.commentText,
+        paymentTxid: params.txid,
+        paidSats: 1_023,
+        paymentSeenAt: params.createdAt,
+        paymentBlockHeight: null,
+        paymentBlockTimestamp: null,
+        createdAt: params.createdAt,
+      },
+      params.createdAt,
+    );
+  }
+
+  try {
+    for (const tokenId of [tokenA, tokenB]) {
+      db.upsertTrackedToken({
+        tokenId,
+        groupHex: `46${tokenId}`,
+        groupPrefixHex: "46",
+        kind: "FUNGIBLE",
+      });
+      db.markTokenReady(tokenId, true, 1_000);
+    }
+
+    publishReview({
+      invoiceId: "invoice-old",
+      reviewId: "review-old",
+      tokenId: tokenA,
+      authorAddress: authorA,
+      score: 2,
+      commentText: "old",
+      txid: "1".repeat(64),
+      createdAt: 2_000,
+    });
+    publishReview({
+      invoiceId: "invoice-other",
+      reviewId: "review-other",
+      tokenId: tokenA,
+      authorAddress: authorB,
+      score: 8,
+      commentText: "",
+      txid: "2".repeat(64),
+      createdAt: 2_500,
+    });
+    publishReview({
+      invoiceId: "invoice-new",
+      reviewId: "review-new",
+      tokenId: tokenA,
+      authorAddress: authorA,
+      score: 10,
+      commentText: "new",
+      txid: "3".repeat(64),
+      createdAt: 3_000,
+    });
+
+    const page = serviceDeps.listTokens({
+      page: 1,
+      pageSize: 10,
+      readyOnly: true,
+      sort: "totalTradeCount",
+      order: "asc",
+    });
+    const itemA = page.items.find((item) => item.tokenId === tokenA);
+    const itemB = page.items.find((item) => item.tokenId === tokenB);
+
+    assert.equal(itemA?.reviewAverageScore, 9);
+    assert.equal(itemA?.reviewScorerCount, 2);
+    assert.equal(itemA?.reviewCountTotal, 3);
+    assert.equal(itemA?.reviewCommentCountTotal, 2);
+    assert.equal(itemA?.lastReviewAt, 3_000);
+    assert.equal(itemB?.reviewAverageScore, null);
+    assert.equal(itemB?.reviewScorerCount, 0);
+    assert.equal(itemB?.reviewCountTotal, 0);
+    assert.equal(itemB?.reviewCommentCountTotal, 0);
+    assert.equal(itemB?.lastReviewAt, null);
+
+    const detail = serviceDeps.getToken(tokenA);
+    assert.equal(detail?.summary.reviewAverageScore, 9);
+    assert.equal(detail?.summary.reviewScorerCount, 2);
+    assert.equal(detail?.summary.reviewCountTotal, 3);
+    assert.equal(detail?.summary.reviewCommentCountTotal, 2);
+    assert.equal(detail?.summary.lastReviewAt, 3_000);
+  } finally {
+    serviceDeps.stop();
     db.close();
   }
 });

@@ -12,9 +12,12 @@ import {
   type ApiAccessRecord,
   isAnalyticsRouteKey,
 } from "../lib/analytics.js";
+import { ReviewError } from "../lib/reviews.js";
 import type {
   CandleInterval,
+  CreateReviewInvoiceInput,
   ServiceReadApi,
+  SubmitReviewInvoiceTxInput,
   TokenListQuery,
   TokenCandleQuery,
   TokenSortField,
@@ -183,6 +186,65 @@ function classifyBusinessRoute(segments: string[]): BusinessRouteMatch | null {
     };
   }
 
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews"
+  ) {
+    return {
+      routeKey: "tokens.reviews.list",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews" &&
+    segments[4] === "summary"
+  ) {
+    return {
+      routeKey: "tokens.reviews.summary",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews" &&
+    segments[4] === "invoices"
+  ) {
+    return {
+      routeKey: "tokens.review-invoices.create",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "review-invoices"
+  ) {
+    return {
+      routeKey: "review-invoices.detail",
+    };
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "review-invoices" &&
+    segments[3] === "submit-tx"
+  ) {
+    return {
+      routeKey: "review-invoices.submit-tx",
+    };
+  }
+
   if (segments.length === 2 && segments[0] === "api" && segments[1] === "trades") {
     return { routeKey: "trades.list" };
   }
@@ -284,14 +346,40 @@ function parseCandleInterval(rawValue: string | null): CandleInterval {
   );
 }
 
-function methodNotAllowed(res: ServerResponse): void {
+function methodNotAllowed(res: ServerResponse, allowedMethod = "GET"): void {
   sendJson(res, 405, {
     ok: false,
     error: {
       code: "METHOD_NOT_ALLOWED",
-      message: "Only GET is supported",
+      message: `Only ${allowedMethod} is supported`,
     },
   });
+}
+
+function isAllowedReviewPostRoute(segments: string[]): boolean {
+  return (
+    (segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "tokens" &&
+      segments[3] === "reviews" &&
+      segments[4] === "invoices") ||
+    (segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "review-invoices" &&
+      segments[3] === "submit-tx")
+  );
+}
+
+function requireMethod(
+  req: IncomingMessage,
+  res: ServerResponse,
+  method: "GET" | "POST",
+): boolean {
+  if (req.method === method) {
+    return true;
+  }
+  methodNotAllowed(res, method);
+  return false;
 }
 
 function notFound(res: ServerResponse): void {
@@ -314,6 +402,47 @@ function sendHttpError(res: ServerResponse, error: ApiHttpError): void {
   });
 }
 
+async function readJsonObjectBody(
+  req: IncomingMessage,
+): Promise<Record<string, unknown>> {
+  let body = "";
+  let bytes = 0;
+
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    bytes += buffer.length;
+    if (bytes > 16 * 1024) {
+      throw new ApiHttpError(
+        413,
+        "BODY_TOO_LARGE",
+        "Request body must be at most 16 KiB",
+      );
+    }
+    body += buffer.toString("utf8");
+  }
+
+  if (body.trim().length === 0) {
+    return {};
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new ApiHttpError(400, "INVALID_JSON", "Request body must be valid JSON");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ApiHttpError(
+      400,
+      "INVALID_BODY",
+      "Request body must be a JSON object",
+    );
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
 async function routeRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -321,14 +450,20 @@ async function routeRequest(
   options: Required<ApiServerOptions>,
   context: ParsedRequestContext,
 ): Promise<void> {
-  if (req.method !== "GET") {
+  const { parsedUrl, segments } = context;
+
+  if (
+    req.method !== "GET" &&
+    !(req.method === "POST" && isAllowedReviewPostRoute(segments))
+  ) {
     methodNotAllowed(res);
     return;
   }
 
-  const { parsedUrl, segments } = context;
-
   if (segments.length === 1 && segments[0] === "healthz") {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
     const healthy = dataService.isHealthy ? await dataService.isHealthy() : true;
     sendJson(res, healthy ? 200 : 503, {
       ok: true,
@@ -503,6 +638,80 @@ async function routeRequest(
   }
 
   if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews"
+  ) {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
+    const query = {
+      page: parsePositiveInt(
+        parsedUrl.searchParams.get("page"),
+        "page",
+        DEFAULT_PAGE,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      pageSize: parsePositiveInt(
+        parsedUrl.searchParams.get("pageSize"),
+        "pageSize",
+        DEFAULT_PAGE_SIZE,
+        options.maxPageSize,
+      ),
+    };
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.listTokenReviews(segments[2], query),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews" &&
+    segments[4] === "summary"
+  ) {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.getTokenReviewSummary(segments[2]),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "reviews" &&
+    segments[4] === "invoices"
+  ) {
+    if (!requireMethod(req, res, "POST")) {
+      return;
+    }
+    const body = await readJsonObjectBody(req);
+    const input: CreateReviewInvoiceInput = {
+      authorAddress:
+        typeof body.authorAddress === "string" ? body.authorAddress : "",
+      score: typeof body.score === "number" ? body.score : Number.NaN,
+      comment:
+        body.comment === undefined || body.comment === null
+          ? undefined
+          : (body.comment as string),
+    };
+    sendJson(res, 201, {
+      ok: true,
+      data: await dataService.createReviewInvoice(segments[2], input),
+    });
+    return;
+  }
+
+  if (
     segments.length === 3 &&
     segments[0] === "api" &&
     segments[1] === "tokens"
@@ -571,6 +780,46 @@ async function routeRequest(
     return;
   }
 
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "review-invoices"
+  ) {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
+    const invoice = await dataService.getReviewInvoice(segments[2]);
+    if (!invoice) {
+      throw new ApiHttpError(
+        404,
+        "INVOICE_NOT_FOUND",
+        "Review invoice not found",
+      );
+    }
+    sendJson(res, 200, { ok: true, data: invoice });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "review-invoices" &&
+    segments[3] === "submit-tx"
+  ) {
+    if (!requireMethod(req, res, "POST")) {
+      return;
+    }
+    const body = await readJsonObjectBody(req);
+    const input: SubmitReviewInvoiceTxInput = {
+      txid: typeof body.txid === "string" ? body.txid : "",
+    };
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.submitReviewInvoiceTx(segments[2], input),
+    });
+    return;
+  }
+
   if (segments.length === 2 && segments[0] === "api" && segments[1] === "trades") {
     if (!dataService.listTrades) {
       throw new ApiHttpError(
@@ -631,6 +880,14 @@ export function createApiRequestHandler(
     } catch (error) {
       if (error instanceof ApiHttpError) {
         sendHttpError(res, error);
+      } else if (error instanceof ReviewError) {
+        sendJson(res, error.statusCode, {
+          ok: false,
+          error: {
+            code: error.code,
+            message: error.message,
+          },
+        });
       } else {
         sendJson(res, 500, {
           ok: false,

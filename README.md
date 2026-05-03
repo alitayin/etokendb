@@ -1,6 +1,6 @@
 # etokendb
 
-`etokendb` is a read-only HTTP service for Agora token discovery, trade history, rolling token metrics, and server-side access analytics.
+`etokendb` is an HTTP service for Agora token discovery, trade history, rolling token metrics, paid token reviews, and server-side access analytics.
 
 It stores synced data in SQLite, exposes public JSON APIs, and can run behind nginx or directly on a VPS.
 
@@ -13,7 +13,7 @@ It stores synced data in SQLite, exposes public JSON APIs, and can run behind ng
 
 ## Public API surface
 
-Current public `GET` endpoints:
+Current public endpoints:
 
 - `/healthz`
 - `/readyz`
@@ -22,6 +22,11 @@ Current public `GET` endpoints:
 - `/api/tokens/:tokenId`
 - `/api/tokens/:tokenId/trades`
 - `/api/tokens/:tokenId/candles`
+- `/api/tokens/:tokenId/reviews`
+- `/api/tokens/:tokenId/reviews/summary`
+- `POST /api/tokens/:tokenId/reviews/invoices`
+- `/api/review-invoices/:invoiceId`
+- `POST /api/review-invoices/:invoiceId/submit-tx`
 - `/api/trades`
 - `/api/analytics/summary`
 - `/api/analytics/endpoints`

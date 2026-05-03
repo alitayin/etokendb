@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { Readable } from "node:stream";
 import test from "node:test";
 
 import type { ApiAccessRecord } from "../lib/analytics.js";
@@ -16,6 +17,7 @@ import type {
   TokenCandlesResult,
   TokenCandleQuery,
   PaginatedResult,
+  ReviewInvoice,
   ServiceStatus,
   TokenDetail,
   TokenListQuery,
@@ -39,9 +41,14 @@ async function invoke(
   method: string,
   url: string,
   options: ApiServerOptions = {},
+  body?: unknown,
 ): Promise<MockResponseResult> {
   const handler = createApiRequestHandler(service, options);
-  const request = { method, url } as IncomingMessage;
+  const request = Readable.from(
+    body === undefined ? [] : [JSON.stringify(body)],
+  ) as IncomingMessage;
+  request.method = method;
+  request.url = url;
 
   let bodyText = "";
   const headers: Record<string, string> = {};
@@ -125,6 +132,11 @@ function sampleTokenSummary(tokenId = "token-1"): TokenSummary {
     visitCountTotal: 7,
     visitCount24h: 3,
     lastVisitedAt: 555,
+    reviewAverageScore: null,
+    reviewScorerCount: 0,
+    reviewCountTotal: 0,
+    reviewCommentCountTotal: 0,
+    lastReviewAt: null,
   };
 }
 
@@ -258,6 +270,23 @@ function sampleTokenVisitAnalytics(
   };
 }
 
+function sampleReviewInvoice(status: ReviewInvoice["status"] = "pending"): ReviewInvoice {
+  return {
+    invoiceId: "invoice-1",
+    tokenId: "a".repeat(64),
+    authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+    score: 8,
+    comment: "solid token",
+    paymentAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+    expectedPaidSats: 10_000_123,
+    expectedPaidXec: "100001.23",
+    status,
+    expiresAt: 1_000_000,
+    paymentTxid: null,
+    publishedReviewId: null,
+  };
+}
+
 function makeBaseService(): ApiDataService {
   return {
     isHealthy: () => true,
@@ -322,6 +351,22 @@ function makeBaseService(): ApiDataService {
       timezone: "Asia/Shanghai",
       items: [],
     }),
+    listTokenReviews: (_tokenId, query) => ({
+      items: [],
+      page: query.page,
+      pageSize: query.pageSize,
+      total: 0,
+    }),
+    getTokenReviewSummary: () => ({
+      averageScore: null,
+      scorerCount: 0,
+      reviewCountTotal: 0,
+      commentCountTotal: 0,
+      lastReviewAt: null,
+    }),
+    createReviewInvoice: () => sampleReviewInvoice(),
+    getReviewInvoice: () => null,
+    submitReviewInvoiceTx: async () => sampleReviewInvoice("tx_submitted"),
   };
 }
 
@@ -597,6 +642,135 @@ test("token candles endpoint parses query and returns chart data", async () => {
   assert.equal(missing.statusCode, 404);
 });
 
+test("review endpoints expose summaries, lists, invoices, and tx submission", async () => {
+  const tokenId = "a".repeat(64);
+  const txid = "b".repeat(64);
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    listTokenReviews: (receivedTokenId, query) => {
+      assert.equal(receivedTokenId, tokenId);
+      assert.deepEqual(query, { page: 2, pageSize: 3 });
+      return {
+        page: 2,
+        pageSize: 3,
+        total: 1,
+        items: [
+          {
+            reviewId: "review-1",
+            tokenId,
+            authorMasked: "ecash:q...kuu2",
+            score: 9,
+            comment: "",
+            createdAt: 123,
+          },
+        ],
+      };
+    },
+    getTokenReviewSummary: (receivedTokenId) => {
+      assert.equal(receivedTokenId, tokenId);
+      return {
+        averageScore: 9,
+        scorerCount: 1,
+        reviewCountTotal: 1,
+        commentCountTotal: 0,
+        lastReviewAt: 123,
+      };
+    },
+    createReviewInvoice: (receivedTokenId, input) => {
+      assert.equal(receivedTokenId, tokenId);
+      assert.deepEqual(input, {
+        authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+        score: 9,
+        comment: undefined,
+      });
+      return sampleReviewInvoice();
+    },
+    getReviewInvoice: (invoiceId) =>
+      invoiceId === "invoice-1" ? sampleReviewInvoice("published") : null,
+    submitReviewInvoiceTx: async (invoiceId, input) => {
+      assert.equal(invoiceId, "invoice-1");
+      assert.deepEqual(input, { txid });
+      return sampleReviewInvoice("tx_submitted");
+    },
+  };
+
+  const reviews = await invoke(
+    service,
+    "GET",
+    `/api/tokens/${tokenId}/reviews?page=2&pageSize=3`,
+  );
+  assert.equal(reviews.statusCode, 200);
+  assert.deepEqual((reviews.bodyJson as { data: unknown }).data, {
+    page: 2,
+    pageSize: 3,
+    total: 1,
+    items: [
+      {
+        reviewId: "review-1",
+        tokenId,
+        authorMasked: "ecash:q...kuu2",
+        score: 9,
+        comment: "",
+        createdAt: 123,
+      },
+    ],
+  });
+
+  const summary = await invoke(
+    service,
+    "GET",
+    `/api/tokens/${tokenId}/reviews/summary`,
+  );
+  assert.equal(summary.statusCode, 200);
+  assert.deepEqual((summary.bodyJson as { data: unknown }).data, {
+    averageScore: 9,
+    scorerCount: 1,
+    reviewCountTotal: 1,
+    commentCountTotal: 0,
+    lastReviewAt: 123,
+  });
+
+  const created = await invoke(
+    service,
+    "POST",
+    `/api/tokens/${tokenId}/reviews/invoices`,
+    {},
+    {
+      authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      score: 9,
+    },
+  );
+  assert.equal(created.statusCode, 201);
+  assert.deepEqual((created.bodyJson as { data: unknown }).data, sampleReviewInvoice());
+
+  const detail = await invoke(service, "GET", "/api/review-invoices/invoice-1");
+  assert.equal(detail.statusCode, 200);
+  assert.equal(
+    ((detail.bodyJson as { data: ReviewInvoice }).data).status,
+    "published",
+  );
+
+  const submitted = await invoke(
+    service,
+    "POST",
+    "/api/review-invoices/invoice-1/submit-tx",
+    {},
+    { txid },
+  );
+  assert.equal(submitted.statusCode, 200);
+  assert.equal(
+    ((submitted.bodyJson as { data: ReviewInvoice }).data).status,
+    "tx_submitted",
+  );
+
+  const wrongMethod = await invoke(
+    service,
+    "GET",
+    `/api/tokens/${tokenId}/reviews/invoices`,
+  );
+  assert.equal(wrongMethod.statusCode, 405);
+});
+
 test("global trades endpoint is optional", async () => {
   const disabled = await invoke(makeBaseService(), "GET", "/api/trades");
   assert.equal(disabled.statusCode, 404);
@@ -652,6 +826,7 @@ test("invalid query and method return proper errors", async () => {
 
 test("analytics recorder tracks matched business routes only after final status is known", async () => {
   const recorded: ApiAccessRecord[] = [];
+  const reviewTokenId = "a".repeat(64);
   const service: ApiDataService = {
     ...makeBaseService(),
     getToken: (tokenId) => (tokenId === "token-a" ? sampleTokenDetail(tokenId) : null),
@@ -671,6 +846,24 @@ test("analytics recorder tracks matched business routes only after final status 
   await invoke(service, "GET", "/api/status", options);
   await invoke(service, "POST", "/api/tokens", options);
   await invoke(service, "GET", "/api/tokens/token-a", options);
+  await invoke(service, "GET", `/api/tokens/${reviewTokenId}/reviews`, options);
+  await invoke(
+    service,
+    "POST",
+    `/api/tokens/${reviewTokenId}/reviews/invoices`,
+    options,
+    {
+      authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      score: 8,
+    },
+  );
+  await invoke(
+    service,
+    "POST",
+    "/api/review-invoices/invoice-1/submit-tx",
+    options,
+    { txid: "b".repeat(64) },
+  );
   await invoke(service, "GET", "/api/tokens/token-missing", options);
   await invoke(service, "GET", "/api/unknown", options);
   await invoke(service, "GET", "/api/analytics/summary", options);
@@ -693,6 +886,24 @@ test("analytics recorder tracks matched business routes only after final status 
       statusCode: 200,
       tokenId: "token-a",
       countTokenVisit: true,
+    },
+    {
+      routeKey: "tokens.reviews.list",
+      statusCode: 200,
+      tokenId: reviewTokenId,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "tokens.review-invoices.create",
+      statusCode: 201,
+      tokenId: reviewTokenId,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "review-invoices.submit-tx",
+      statusCode: 200,
+      tokenId: undefined,
+      countTokenVisit: false,
     },
     {
       routeKey: "tokens.detail",

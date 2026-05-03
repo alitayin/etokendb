@@ -92,6 +92,11 @@ export interface TokenSummary {
   visitCountTotal: number;
   visitCount24h: number;
   lastVisitedAt: number | null;
+  reviewAverageScore: number | null;
+  reviewScorerCount: number;
+  reviewCountTotal: number;
+  reviewCommentCountTotal: number;
+  lastReviewAt: number | null;
 }
 
 export interface TokenDetail {
@@ -209,6 +214,55 @@ export interface TokenVisitAnalytics extends TokenVisitSummary {
   buckets: TokenVisitBucket[];
 }
 
+export type ReviewInvoiceStatus =
+  | "pending"
+  | "tx_submitted"
+  | "published"
+  | "invalid"
+  | "expired";
+
+export interface CreateReviewInvoiceInput {
+  authorAddress: string;
+  score: number;
+  comment?: string;
+}
+
+export interface SubmitReviewInvoiceTxInput {
+  txid: string;
+}
+
+export interface ReviewInvoice {
+  invoiceId: string;
+  tokenId: string;
+  authorAddress: string;
+  score: number;
+  comment: string;
+  paymentAddress: string;
+  expectedPaidSats: number;
+  expectedPaidXec: string;
+  status: ReviewInvoiceStatus;
+  expiresAt: number;
+  paymentTxid: string | null;
+  publishedReviewId: string | null;
+}
+
+export interface TokenReviewItem {
+  reviewId: string;
+  tokenId: string;
+  authorMasked: string;
+  score: number;
+  comment: string;
+  createdAt: number;
+}
+
+export interface TokenReviewSummary {
+  averageScore: number | null;
+  scorerCount: number;
+  reviewCountTotal: number;
+  commentCountTotal: number;
+  lastReviewAt: number | null;
+}
+
 export interface ServiceReadApi {
   getStatus(): ServiceStatus;
   isReady(): boolean;
@@ -231,4 +285,18 @@ export interface ServiceReadApi {
     query: TokenCandleQuery,
   ): TokenCandlesResult;
   listTrades(query: TradeListQuery): PaginatedResult<TradeHistoryItem>;
+  listTokenReviews(
+    tokenId: string,
+    query: PaginationQuery,
+  ): PaginatedResult<TokenReviewItem>;
+  getTokenReviewSummary(tokenId: string): TokenReviewSummary;
+  createReviewInvoice(
+    tokenId: string,
+    input: CreateReviewInvoiceInput,
+  ): ReviewInvoice;
+  getReviewInvoice(invoiceId: string): ReviewInvoice | null;
+  submitReviewInvoiceTx(
+    invoiceId: string,
+    input: SubmitReviewInvoiceTxInput,
+  ): Promise<ReviewInvoice>;
 }

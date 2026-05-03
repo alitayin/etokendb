@@ -1,6 +1,11 @@
 import "dotenv/config";
 
 import { DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS } from "./analytics.js";
+import {
+  REVIEW_DEFAULT_BASE_FEE_SATS,
+  REVIEW_DEFAULT_INVOICE_TTL_MS,
+  REVIEW_DEFAULT_RETRY_INTERVAL_MS,
+} from "./reviews.js";
 
 export interface AppConfig {
   chronikUrl: string;
@@ -16,6 +21,10 @@ export interface AppConfig {
   apiPageSizeDefault: number;
   apiPageSizeMax: number;
   analyticsHourlyRetentionHours: number;
+  reviewPaymentAddress: string | null;
+  reviewBaseFeeSats: number;
+  reviewInvoiceTtlMs: number;
+  reviewRetryIntervalMs: number;
   requestTimeoutMs: number;
   requestRetryCount: number;
   wsConnectTimeoutMs: number;
@@ -76,6 +85,19 @@ export function loadConfig(): AppConfig {
     analyticsHourlyRetentionHours: readPositiveInt(
       "ANALYTICS_HOURLY_RETENTION_HOURS",
       DEFAULT_ANALYTICS_HOURLY_RETENTION_HOURS,
+    ),
+    reviewPaymentAddress: process.env.REVIEW_PAYMENT_ADDRESS?.trim() || null,
+    reviewBaseFeeSats: readPositiveInt(
+      "REVIEW_BASE_FEE_SATS",
+      REVIEW_DEFAULT_BASE_FEE_SATS,
+    ),
+    reviewInvoiceTtlMs: readPositiveInt(
+      "REVIEW_INVOICE_TTL_MS",
+      REVIEW_DEFAULT_INVOICE_TTL_MS,
+    ),
+    reviewRetryIntervalMs: readPositiveInt(
+      "REVIEW_RETRY_INTERVAL_MS",
+      REVIEW_DEFAULT_RETRY_INTERVAL_MS,
     ),
     requestTimeoutMs: readPositiveInt("REQUEST_TIMEOUT_MS", 20_000),
     requestRetryCount: readPositiveInt("REQUEST_RETRY_COUNT", 3),

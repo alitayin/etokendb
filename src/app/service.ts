@@ -1,6 +1,7 @@
 import fs from "node:fs";
+import { randomInt, randomUUID } from "node:crypto";
 
-import type { WsEndpoint, WsMsgClient } from "chronik-client";
+import type { Tx, WsEndpoint, WsMsgClient } from "chronik-client";
 
 import {
   discoverActiveTokens,
@@ -18,19 +19,40 @@ import {
 import { retryAsync, withTimeout } from "../lib/async.js";
 import type { AppConfig } from "../lib/config.js";
 import type { AppDatabase } from "../lib/db.js";
+import {
+  REVIEW_INVOICE_VERIFIER_MAX_SATS,
+  REVIEW_INVOICE_VERIFIER_MIN_SATS,
+  ReviewError,
+  maskEcashAddress,
+  normalizeComment,
+  normalizeEcashAddress,
+  normalizeScore,
+  normalizeTokenId,
+  normalizeTxid,
+  normalizeVerifierSats,
+  satsToXecString,
+  verifyReviewPaymentTx,
+  type ReviewInvoiceRecord,
+  type TokenReviewRecord,
+} from "../lib/reviews.js";
 import type { ActiveTokenSeed } from "../lib/types.js";
 import type {
   AnalyticsSummary,
+  CreateReviewInvoiceInput,
   EndpointAnalyticsDetail,
   EndpointAnalyticsSummary,
   TokenCandle,
   TokenCandlesResult,
   TokenCandleQuery,
+  PaginationQuery,
   PaginatedResult,
   ServiceReadApi,
   ServiceStatus,
+  SubmitReviewInvoiceTxInput,
   TokenDetail,
   TokenListQuery,
+  TokenReviewItem,
+  TokenReviewSummary,
   TokenSortField,
   TokenSummary,
   TokenVisitAnalytics,
@@ -76,6 +98,10 @@ export interface AgoraTokenServiceOptions {
   logger?: Logger;
   ops?: Partial<CoordinatorOps>;
   deferKnownTradeCountLte?: number | null;
+  nowMs?: () => number;
+  reviewInvoiceIdFactory?: () => string;
+  reviewIdFactory?: () => string;
+  reviewVerifierSatsFactory?: () => number;
 }
 
 function toIso(timestampMs: number | null): string | null {
@@ -182,6 +208,38 @@ function formatPriceChangePct(bpsRaw: string | null | undefined): string {
   return `${negative ? "-" : ""}${whole.toString()}.${fraction}`;
 }
 
+const REVIEW_SUMMARY_JOIN_SQL = `
+  LEFT JOIN (
+    SELECT
+      token_id,
+      COUNT(*) AS review_count_total,
+      COALESCE(SUM(CASE WHEN comment_text <> '' THEN 1 ELSE 0 END), 0) AS review_comment_count_total,
+      MAX(created_at) AS last_review_at
+    FROM token_reviews
+    GROUP BY token_id
+  ) review_totals
+    ON review_totals.token_id = t.token_id
+  LEFT JOIN (
+    SELECT
+      token_id,
+      AVG(score) AS review_average_score,
+      COUNT(*) AS review_scorer_count
+    FROM (
+      SELECT
+        token_id,
+        score,
+        ROW_NUMBER() OVER (
+          PARTITION BY token_id, author_address
+          ORDER BY created_at DESC, rowid DESC
+        ) AS row_rank
+      FROM token_reviews
+    ) ranked
+    WHERE row_rank = 1
+    GROUP BY token_id
+  ) review_scores
+    ON review_scores.token_id = t.token_id
+`;
+
 function toTokenSummary(row: Record<string, unknown>): TokenSummary {
   return {
     tokenId: row.token_id as string,
@@ -228,6 +286,17 @@ function toTokenSummary(row: Record<string, unknown>): TokenSummary {
       row.last_visited_at === null || row.last_visited_at === undefined
         ? null
         : Number(row.last_visited_at),
+    reviewAverageScore:
+      row.review_average_score === null || row.review_average_score === undefined
+        ? null
+        : Number(row.review_average_score),
+    reviewScorerCount: Number(row.review_scorer_count ?? 0),
+    reviewCountTotal: Number(row.review_count_total ?? 0),
+    reviewCommentCountTotal: Number(row.review_comment_count_total ?? 0),
+    lastReviewAt:
+      row.last_review_at === null || row.last_review_at === undefined
+        ? null
+        : Number(row.last_review_at),
   };
 }
 
@@ -288,6 +357,34 @@ function toTokenCandle(row: Record<string, unknown>): TokenCandle {
   };
 }
 
+function toReviewInvoice(record: ReviewInvoiceRecord) {
+  return {
+    invoiceId: record.invoiceId,
+    tokenId: record.tokenId,
+    authorAddress: record.authorAddress,
+    score: record.score,
+    comment: record.commentText,
+    paymentAddress: record.paymentAddress,
+    expectedPaidSats: record.expectedPaidSats,
+    expectedPaidXec: satsToXecString(record.expectedPaidSats),
+    status: record.status,
+    expiresAt: record.expiresAt,
+    paymentTxid: record.paymentTxid,
+    publishedReviewId: record.publishedReviewId,
+  };
+}
+
+function toTokenReviewItem(record: TokenReviewRecord): TokenReviewItem {
+  return {
+    reviewId: record.reviewId,
+    tokenId: record.tokenId,
+    authorMasked: maskEcashAddress(record.authorAddress),
+    score: record.score,
+    comment: record.commentText,
+    createdAt: record.createdAt,
+  };
+}
+
 export class AgoraTokenService implements ServiceReadApi {
   private readonly logger: Logger;
   private readonly ops: CoordinatorOps;
@@ -302,6 +399,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private tipRefreshTimer: NodeJS.Timeout | null = null;
   private pollingTailTimer: NodeJS.Timeout | null = null;
   private analyticsPruneTimer: NodeJS.Timeout | null = null;
+  private reviewRetryTimer: NodeJS.Timeout | null = null;
   private workerCount = 0;
   private startedAt = Date.now();
   private phase: ServiceStatus["phase"] = "starting";
@@ -315,6 +413,10 @@ export class AgoraTokenService implements ServiceReadApi {
   private lastError: string | null = null;
   private bootstrapError: Error | null = null;
   private readonly deferKnownTradeCountLte: number | null;
+  private readonly nowMs: () => number;
+  private readonly reviewInvoiceIdFactory: () => string;
+  private readonly reviewIdFactory: () => string;
+  private readonly reviewVerifierSatsFactory: () => number;
 
   constructor(
     private readonly db: AppDatabase,
@@ -330,6 +432,16 @@ export class AgoraTokenService implements ServiceReadApi {
       ...options?.ops,
     };
     this.deferKnownTradeCountLte = options?.deferKnownTradeCountLte ?? null;
+    this.nowMs = options?.nowMs ?? Date.now;
+    this.reviewInvoiceIdFactory = options?.reviewInvoiceIdFactory ?? randomUUID;
+    this.reviewIdFactory = options?.reviewIdFactory ?? randomUUID;
+    this.reviewVerifierSatsFactory =
+      options?.reviewVerifierSatsFactory ??
+      (() =>
+        randomInt(
+          REVIEW_INVOICE_VERIFIER_MIN_SATS,
+          REVIEW_INVOICE_VERIFIER_MAX_SATS + 1,
+        ));
   }
 
   async start(): Promise<void> {
@@ -371,6 +483,10 @@ export class AgoraTokenService implements ServiceReadApi {
     if (this.analyticsPruneTimer) {
       clearInterval(this.analyticsPruneTimer);
       this.analyticsPruneTimer = null;
+    }
+    if (this.reviewRetryTimer) {
+      clearInterval(this.reviewRetryTimer);
+      this.reviewRetryTimer = null;
     }
     if (this.ws) {
       this.ws.close();
@@ -471,7 +587,12 @@ export class AgoraTokenService implements ServiceReadApi {
             s.recent_4320_trade_count,
             s.recent_4320_volume_sats,
             s.last_trade_block_height,
-            s.last_trade_block_timestamp
+            s.last_trade_block_timestamp,
+            review_scores.review_average_score,
+            COALESCE(review_scores.review_scorer_count, 0) AS review_scorer_count,
+            COALESCE(review_totals.review_count_total, 0) AS review_count_total,
+            COALESCE(review_totals.review_comment_count_total, 0) AS review_comment_count_total,
+            review_totals.last_review_at
           FROM tracked_tokens t
           LEFT JOIN token_stats s
             ON s.token_id = t.token_id
@@ -486,6 +607,7 @@ export class AgoraTokenService implements ServiceReadApi {
             GROUP BY token_id
           ) v24
             ON v24.token_id = t.token_id
+          ${REVIEW_SUMMARY_JOIN_SQL}
           ${readyOnly ? "WHERE COALESCE(t.is_ready, 0) = 1" : ""}
           ORDER BY ${tokenSortSql(query.sort ?? "recent144VolumeSats", query.order ?? "desc")}
           LIMIT ?
@@ -531,7 +653,12 @@ export class AgoraTokenService implements ServiceReadApi {
             s.recent_4320_trade_count,
             s.recent_4320_volume_sats,
             s.last_trade_block_height,
-            s.last_trade_block_timestamp
+            s.last_trade_block_timestamp,
+            review_scores.review_average_score,
+            COALESCE(review_scores.review_scorer_count, 0) AS review_scorer_count,
+            COALESCE(review_totals.review_count_total, 0) AS review_count_total,
+            COALESCE(review_totals.review_comment_count_total, 0) AS review_comment_count_total,
+            review_totals.last_review_at
           FROM tracked_tokens t
           LEFT JOIN token_stats s
             ON s.token_id = t.token_id
@@ -546,6 +673,7 @@ export class AgoraTokenService implements ServiceReadApi {
             GROUP BY token_id
           ) v24
             ON v24.token_id = t.token_id
+          ${REVIEW_SUMMARY_JOIN_SQL}
           WHERE t.token_id = ?
         `,
       )
@@ -641,6 +769,242 @@ export class AgoraTokenService implements ServiceReadApi {
     return this.queryTrades(query);
   }
 
+  listTokenReviews(
+    tokenId: string,
+    query: PaginationQuery,
+  ): PaginatedResult<TokenReviewItem> {
+    const normalizedTokenId = normalizeTokenId(tokenId);
+    const { page, pageSize, offset } = normalizePagination(
+      query.page,
+      query.pageSize,
+      this.config,
+    );
+    const result = this.db.listTokenReviews({
+      tokenId: normalizedTokenId,
+      page,
+      pageSize,
+      offset,
+    });
+    return {
+      page: result.page,
+      pageSize: result.pageSize,
+      total: result.total,
+      items: result.items.map(toTokenReviewItem),
+    };
+  }
+
+  getTokenReviewSummary(tokenId: string): TokenReviewSummary {
+    return this.db.getTokenReviewSummary(normalizeTokenId(tokenId));
+  }
+
+  createReviewInvoice(
+    tokenId: string,
+    input: CreateReviewInvoiceInput,
+  ) {
+    const paymentAddress = this.requireReviewPaymentAddress();
+    const normalizedTokenId = normalizeTokenId(tokenId);
+    const authorAddress = normalizeEcashAddress(
+      input.authorAddress,
+      "authorAddress",
+    );
+    const score = normalizeScore(input.score);
+    const commentText = normalizeComment(input.comment);
+    const verifierSats = normalizeVerifierSats(
+      this.reviewVerifierSatsFactory(),
+    );
+    const nowMs = this.nowMs();
+    const expectedPaidSats = this.config.reviewBaseFeeSats + verifierSats;
+
+    return toReviewInvoice(
+      this.db.createReviewInvoice({
+        invoiceId: this.reviewInvoiceIdFactory(),
+        tokenId: normalizedTokenId,
+        authorAddress,
+        score,
+        commentText,
+        paymentAddress,
+        expectedPaidSats,
+        verifierSats,
+        expiresAt: nowMs + this.config.reviewInvoiceTtlMs,
+        createdAt: nowMs,
+      }),
+    );
+  }
+
+  getReviewInvoice(invoiceId: string) {
+    const invoice = this.db.getReviewInvoice(invoiceId);
+    return invoice ? toReviewInvoice(invoice) : null;
+  }
+
+  async submitReviewInvoiceTx(
+    invoiceId: string,
+    input: SubmitReviewInvoiceTxInput,
+  ) {
+    const txid = normalizeTxid(input.txid);
+    const invoice = this.getOpenReviewInvoice(invoiceId);
+    this.ensurePaymentTxidAvailable(txid, invoice.invoiceId);
+
+    const nowMs = this.nowMs();
+    const submittedInvoice =
+      this.db.markReviewInvoiceTxSubmitted(invoice.invoiceId, txid, nowMs) ??
+      invoice;
+
+    const published = await this.tryPublishReviewPayment(submittedInvoice, nowMs, {
+      throwOnInvalid: true,
+    });
+    return toReviewInvoice(published ?? submittedInvoice);
+  }
+
+  expireReviewInvoices(nowMs = this.nowMs()): number {
+    return this.db.expireReviewInvoices(nowMs);
+  }
+
+  async retryPendingReviewPayments(limit = 50): Promise<{
+    checked: number;
+    published: number;
+    invalid: number;
+    expired: number;
+  }> {
+    const nowMs = this.nowMs();
+    const expired = this.expireReviewInvoices(nowMs);
+    const invoices = this.db.listSubmittedReviewInvoices(nowMs, limit);
+    let published = 0;
+    let invalid = 0;
+
+    for (const invoice of invoices) {
+      const result = await this.tryPublishReviewPayment(invoice, nowMs);
+      if (!result) {
+        continue;
+      }
+      if (result.status === "published") {
+        published += 1;
+      } else if (result.status === "invalid") {
+        invalid += 1;
+      }
+    }
+
+    return {
+      checked: invoices.length,
+      published,
+      invalid,
+      expired,
+    };
+  }
+
+  private requireReviewPaymentAddress(): string {
+    const rawAddress = this.config.reviewPaymentAddress;
+    if (!rawAddress) {
+      throw new ReviewError(
+        503,
+        "REVIEW_PAYMENTS_DISABLED",
+        "REVIEW_PAYMENT_ADDRESS is not configured",
+      );
+    }
+
+    try {
+      return normalizeEcashAddress(rawAddress, "REVIEW_PAYMENT_ADDRESS");
+    } catch {
+      throw new ReviewError(
+        503,
+        "REVIEW_PAYMENT_CONFIG_INVALID",
+        "REVIEW_PAYMENT_ADDRESS must be a valid eCash p2pkh or p2sh address",
+      );
+    }
+  }
+
+  private getOpenReviewInvoice(invoiceId: string): ReviewInvoiceRecord {
+    const invoice = this.db.getReviewInvoice(invoiceId);
+    if (!invoice) {
+      throw new ReviewError(404, "INVOICE_NOT_FOUND", "Review invoice not found");
+    }
+
+    const nowMs = this.nowMs();
+    if (
+      (invoice.status === "pending" || invoice.status === "tx_submitted") &&
+      invoice.expiresAt <= nowMs
+    ) {
+      this.db.expireReviewInvoices(nowMs);
+      throw new ReviewError(410, "INVOICE_EXPIRED", "Review invoice has expired");
+    }
+
+    if (invoice.status === "expired") {
+      throw new ReviewError(410, "INVOICE_EXPIRED", "Review invoice has expired");
+    }
+
+    if (invoice.status !== "pending" && invoice.status !== "tx_submitted") {
+      throw new ReviewError(
+        409,
+        "INVOICE_NOT_OPEN",
+        `Review invoice is ${invoice.status}`,
+      );
+    }
+
+    return invoice;
+  }
+
+  private ensurePaymentTxidAvailable(txid: string, invoiceId: string): void {
+    const existing = this.db.getReviewInvoiceByPaymentTxid(txid);
+    if (existing && existing.invoiceId !== invoiceId) {
+      throw new ReviewError(
+        409,
+        "PAYMENT_TXID_REUSED",
+        "payment txid is already attached to another review invoice",
+      );
+    }
+  }
+
+  private async tryPublishReviewPayment(
+    invoice: ReviewInvoiceRecord,
+    nowMs: number,
+    options: { throwOnInvalid?: boolean } = {},
+  ): Promise<ReviewInvoiceRecord | null> {
+    if (!invoice.paymentTxid) {
+      return null;
+    }
+
+    let tx: Tx;
+    try {
+      tx = await this.deps.chronik.tx(invoice.paymentTxid);
+    } catch {
+      return null;
+    }
+
+    let verification;
+    try {
+      verification = verifyReviewPaymentTx({
+        tx,
+        txid: invoice.paymentTxid,
+        invoice,
+        nowMs,
+      });
+    } catch (error) {
+      const invalidInvoice =
+        this.db.markReviewInvoiceInvalid(invoice.invoiceId, nowMs) ?? invoice;
+      if (options.throwOnInvalid) {
+        throw error;
+      }
+      return invalidInvoice;
+    }
+
+    return this.db.publishTokenReview(
+      {
+        reviewId: this.reviewIdFactory(),
+        invoiceId: invoice.invoiceId,
+        tokenId: invoice.tokenId,
+        authorAddress: invoice.authorAddress,
+        score: invoice.score,
+        commentText: invoice.commentText,
+        paymentTxid: invoice.paymentTxid,
+        paidSats: verification.paidSats,
+        paymentSeenAt: verification.paymentSeenAt,
+        paymentBlockHeight: verification.paymentBlockHeight,
+        paymentBlockTimestamp: verification.paymentBlockTimestamp,
+        createdAt: nowMs,
+      },
+      nowMs,
+    ).invoice;
+  }
+
   private async bootstrap(): Promise<void> {
     this.phase = "discovering";
     const seeds = await this.discoverTokens("bootstrap");
@@ -692,6 +1056,14 @@ export class AgoraTokenService implements ServiceReadApi {
     this.analyticsPruneTimer = setInterval(() => {
       void this.pruneOldAnalyticsBuckets("background");
     }, ANALYTICS_PRUNE_INTERVAL_MS);
+
+    this.reviewRetryTimer = setInterval(() => {
+      void this.retryPendingReviewPayments().catch((error) => {
+        this.logger.warn(
+          `review payment retry failed | error=${this.formatError(error)}`,
+        );
+      });
+    }, this.config.reviewRetryIntervalMs);
   }
 
   private async pruneOldAnalyticsBuckets(

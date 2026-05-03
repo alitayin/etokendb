@@ -2,9 +2,9 @@ openapi: 3.1.0
 info:
   title: etokendb API
   version: 0.1.0
-  summary: Public read-only API for token metrics, trade history, candles, and server-side access analytics
+  summary: Public API for token metrics, trade history, paid reviews, candles, and server-side access analytics
   description: |
-    etokendb exposes a GET-only JSON API backed by SQLite.
+    etokendb exposes a JSON API backed by SQLite.
 
     Response envelopes:
 
@@ -13,7 +13,7 @@ info:
 
     General rules:
 
-    - All endpoints are GET only
+    - Endpoints are GET only except the documented review invoice POST routes
     - Unsupported methods return `405 METHOD_NOT_ALLOWED`
     - Counts are numbers
     - Large satoshi and price values are strings to preserve precision
@@ -28,6 +28,7 @@ tags:
   - name: Health
   - name: Status
   - name: Tokens
+  - name: Reviews
   - name: Trades
   - name: Analytics
 paths:
@@ -183,6 +184,108 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "404":
           $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/reviews:
+    get:
+      tags: [Tokens, Reviews]
+      summary: List paid reviews for one token
+      operationId: listTokenReviews
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+        - $ref: "#/components/parameters/PageParam"
+        - $ref: "#/components/parameters/PageSizeParam"
+      responses:
+        "200":
+          description: Paginated paid reviews
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTokenReviewsResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/reviews/summary:
+    get:
+      tags: [Tokens, Reviews]
+      summary: Get paid review score summary for one token
+      operationId: getTokenReviewSummary
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+      responses:
+        "200":
+          description: Paid review score summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenReviewSummaryResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/reviews/invoices:
+    post:
+      tags: [Tokens, Reviews]
+      summary: Create a paid review invoice
+      operationId: createReviewInvoice
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateReviewInvoiceRequest"
+      responses:
+        "201":
+          description: Review invoice created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewInvoiceResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/review-invoices/{invoiceId}:
+    get:
+      tags: [Reviews]
+      summary: Get one review invoice
+      operationId: getReviewInvoice
+      parameters:
+        - $ref: "#/components/parameters/InvoiceIdPathParam"
+      responses:
+        "200":
+          description: Review invoice detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewInvoiceResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/review-invoices/{invoiceId}/submit-tx:
+    post:
+      tags: [Reviews]
+      summary: Submit a review payment transaction id
+      operationId: submitReviewInvoiceTx
+      parameters:
+        - $ref: "#/components/parameters/InvoiceIdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitReviewInvoiceTxRequest"
+      responses:
+        "200":
+          description: Updated review invoice
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewInvoiceResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "410":
+          $ref: "#/components/responses/ErrorResponse"
   /api/trades:
     get:
       tags: [Trades]
@@ -313,6 +416,13 @@ components:
       description: Token identifier
       schema:
         type: string
+    InvoiceIdPathParam:
+      name: invoiceId
+      in: path
+      required: true
+      description: Review invoice identifier
+      schema:
+        type: string
     PageParam:
       name: page
       in: query
@@ -401,6 +511,11 @@ components:
         - tokens.detail
         - tokens.trades
         - tokens.candles
+        - tokens.reviews.list
+        - tokens.reviews.summary
+        - tokens.review-invoices.create
+        - review-invoices.detail
+        - review-invoices.submit-tx
         - trades.list
     ErrorBody:
       type: object
@@ -564,6 +679,11 @@ components:
         - visitCountTotal
         - visitCount24h
         - lastVisitedAt
+        - reviewAverageScore
+        - reviewScorerCount
+        - reviewCountTotal
+        - reviewCommentCountTotal
+        - lastReviewAt
       properties:
         tokenId:
           type: string
@@ -613,6 +733,18 @@ components:
         visitCount24h:
           type: integer
         lastVisitedAt:
+          type: integer
+          nullable: true
+        reviewAverageScore:
+          type: number
+          nullable: true
+        reviewScorerCount:
+          type: integer
+        reviewCountTotal:
+          type: integer
+        reviewCommentCountTotal:
+          type: integer
+        lastReviewAt:
           type: integer
           nullable: true
     TokenDetail:
@@ -774,6 +906,161 @@ components:
           enum: [true]
         data:
           $ref: "#/components/schemas/TokenCandlesResult"
+    ReviewInvoiceStatus:
+      type: string
+      enum:
+        - pending
+        - tx_submitted
+        - published
+        - invalid
+        - expired
+    CreateReviewInvoiceRequest:
+      type: object
+      required: [authorAddress, score]
+      properties:
+        authorAddress:
+          type: string
+        score:
+          type: integer
+          minimum: 0
+          maximum: 10
+        comment:
+          type: string
+          maxLength: 500
+          description: Maximum 500 UTF-8 bytes.
+    SubmitReviewInvoiceTxRequest:
+      type: object
+      required: [txid]
+      properties:
+        txid:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+    ReviewInvoice:
+      type: object
+      required:
+        - invoiceId
+        - tokenId
+        - authorAddress
+        - score
+        - comment
+        - paymentAddress
+        - expectedPaidSats
+        - expectedPaidXec
+        - status
+        - expiresAt
+        - paymentTxid
+        - publishedReviewId
+      properties:
+        invoiceId:
+          type: string
+        tokenId:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+        authorAddress:
+          type: string
+        score:
+          type: integer
+          minimum: 0
+          maximum: 10
+        comment:
+          type: string
+        paymentAddress:
+          type: string
+        expectedPaidSats:
+          type: integer
+        expectedPaidXec:
+          type: string
+        status:
+          $ref: "#/components/schemas/ReviewInvoiceStatus"
+        expiresAt:
+          type: integer
+        paymentTxid:
+          type: string
+          nullable: true
+        publishedReviewId:
+          type: string
+          nullable: true
+    ReviewInvoiceResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/ReviewInvoice"
+    TokenReviewItem:
+      type: object
+      required: [reviewId, tokenId, authorMasked, score, comment, createdAt]
+      properties:
+        reviewId:
+          type: string
+        tokenId:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+        authorMasked:
+          type: string
+        score:
+          type: integer
+          minimum: 0
+          maximum: 10
+        comment:
+          type: string
+        createdAt:
+          type: integer
+    PaginatedTokenReviews:
+      type: object
+      required: [page, pageSize, total, items]
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TokenReviewItem"
+    PaginatedTokenReviewsResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/PaginatedTokenReviews"
+    TokenReviewSummary:
+      type: object
+      required:
+        - averageScore
+        - scorerCount
+        - reviewCountTotal
+        - commentCountTotal
+        - lastReviewAt
+      properties:
+        averageScore:
+          type: number
+          nullable: true
+        scorerCount:
+          type: integer
+        reviewCountTotal:
+          type: integer
+        commentCountTotal:
+          type: integer
+        lastReviewAt:
+          type: integer
+          nullable: true
+    TokenReviewSummaryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/TokenReviewSummary"
     ApiAccessBucket:
       type: object
       required:

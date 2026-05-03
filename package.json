@@ -29,6 +29,7 @@
     "chronik-client": "^4.1.0",
     "dotenv": "^17.4.2",
     "ecash-agora": "^4.0.2",
+    "ecashaddrjs": "^2.0.0",
     "pino": "^10.3.1",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"

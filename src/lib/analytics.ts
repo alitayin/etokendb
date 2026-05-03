@@ -4,6 +4,11 @@ export const ANALYTICS_ROUTE_KEYS = [
   "tokens.detail",
   "tokens.trades",
   "tokens.candles",
+  "tokens.reviews.list",
+  "tokens.reviews.summary",
+  "tokens.review-invoices.create",
+  "review-invoices.detail",
+  "review-invoices.submit-tx",
   "trades.list",
 ] as const;
 

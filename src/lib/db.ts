@@ -14,6 +14,14 @@ import {
   retentionCutoffBucketStartMs,
   startOfHourMs,
 } from "./analytics.js";
+import type {
+  CreateReviewInvoiceRecord,
+  PublishTokenReviewRecord,
+  ReviewInvoiceRecord,
+  ReviewInvoiceStatus,
+  TokenReviewRecord,
+  TokenReviewSummaryRecord,
+} from "./reviews.js";
 import { computeRollingStatsSnapshot } from "./stats.js";
 import type {
   ActiveTokenSeed,
@@ -118,6 +126,13 @@ interface ListTokenVisitsOptions {
   nowMs?: number;
 }
 
+interface ListTokenReviewsOptions {
+  tokenId: string;
+  page: number;
+  pageSize: number;
+  offset: number;
+}
+
 export interface AppDatabase {
   sqlite: Database.Database;
   close: () => void;
@@ -178,6 +193,41 @@ export interface AppDatabase {
     tokenId: string,
     nowMs?: number,
   ) => DbTokenVisitSnapshot;
+  createReviewInvoice: (
+    invoice: CreateReviewInvoiceRecord,
+  ) => ReviewInvoiceRecord;
+  getReviewInvoice: (invoiceId: string) => ReviewInvoiceRecord | null;
+  getReviewInvoiceByPaymentTxid: (
+    txid: string,
+  ) => ReviewInvoiceRecord | null;
+  markReviewInvoiceTxSubmitted: (
+    invoiceId: string,
+    txid: string,
+    updatedAt: number,
+  ) => ReviewInvoiceRecord | null;
+  markReviewInvoiceInvalid: (
+    invoiceId: string,
+    updatedAt: number,
+  ) => ReviewInvoiceRecord | null;
+  expireReviewInvoices: (nowMs?: number) => number;
+  listSubmittedReviewInvoices: (
+    nowMs: number,
+    limit: number,
+  ) => ReviewInvoiceRecord[];
+  publishTokenReview: (
+    review: PublishTokenReviewRecord,
+    updatedAt: number,
+  ) => {
+    invoice: ReviewInvoiceRecord;
+    review: TokenReviewRecord;
+  };
+  listTokenReviews: (options: ListTokenReviewsOptions) => {
+    page: number;
+    pageSize: number;
+    total: number;
+    items: TokenReviewRecord[];
+  };
+  getTokenReviewSummary: (tokenId: string) => TokenReviewSummaryRecord;
   pruneOldAnalyticsBuckets: (
     retentionHours: number,
     nowMs?: number,
@@ -351,6 +401,54 @@ function createSchema(sqlite: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_token_visit_hourly_bucket_start
       ON token_visit_hourly (bucket_start);
+
+    CREATE TABLE IF NOT EXISTS review_invoices (
+      invoice_id TEXT PRIMARY KEY,
+      token_id TEXT NOT NULL,
+      author_address TEXT NOT NULL,
+      score INTEGER NOT NULL,
+      comment_text TEXT NOT NULL DEFAULT '',
+      payment_address TEXT NOT NULL,
+      expected_paid_sats INTEGER NOT NULL,
+      verifier_sats INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      payment_txid TEXT,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      published_review_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_review_invoices_token_created
+      ON review_invoices (token_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_review_invoices_status_expires
+      ON review_invoices (status, expires_at);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_review_invoices_payment_txid
+      ON review_invoices (payment_txid)
+      WHERE payment_txid IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS token_reviews (
+      review_id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL UNIQUE,
+      token_id TEXT NOT NULL,
+      author_address TEXT NOT NULL,
+      score INTEGER NOT NULL,
+      comment_text TEXT NOT NULL DEFAULT '',
+      payment_txid TEXT NOT NULL UNIQUE,
+      paid_sats INTEGER NOT NULL,
+      payment_seen_at INTEGER NOT NULL,
+      payment_block_height INTEGER,
+      payment_block_timestamp INTEGER,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_token_reviews_token_created
+      ON token_reviews (token_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_token_reviews_token_author_created
+      ON token_reviews (token_id, author_address, created_at DESC);
   `);
 
   ensureColumn(sqlite, "tracked_tokens", "is_ready", "INTEGER NOT NULL DEFAULT 0");
@@ -623,6 +721,44 @@ function toTokenCandleRow(row: Record<string, unknown>): TokenCandleRow {
     tradeCount: Number(row.trade_count),
     volumeSats: String(row.volume_sats),
     soldAtoms: String(row.sold_atoms),
+  };
+}
+
+function toReviewInvoiceRecord(
+  row: Record<string, unknown>,
+): ReviewInvoiceRecord {
+  return {
+    invoiceId: row.invoice_id as string,
+    tokenId: row.token_id as string,
+    authorAddress: row.author_address as string,
+    score: Number(row.score),
+    commentText: String(row.comment_text ?? ""),
+    paymentAddress: row.payment_address as string,
+    expectedPaidSats: Number(row.expected_paid_sats),
+    verifierSats: Number(row.verifier_sats),
+    status: row.status as ReviewInvoiceStatus,
+    paymentTxid: (row.payment_txid as string | null) ?? null,
+    expiresAt: Number(row.expires_at),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    publishedReviewId: (row.published_review_id as string | null) ?? null,
+  };
+}
+
+function toTokenReviewRecord(row: Record<string, unknown>): TokenReviewRecord {
+  return {
+    reviewId: row.review_id as string,
+    invoiceId: row.invoice_id as string,
+    tokenId: row.token_id as string,
+    authorAddress: row.author_address as string,
+    score: Number(row.score),
+    commentText: String(row.comment_text ?? ""),
+    paymentTxid: row.payment_txid as string,
+    paidSats: Number(row.paid_sats),
+    paymentSeenAt: Number(row.payment_seen_at),
+    paymentBlockHeight: toNullableNumber(row.payment_block_height),
+    paymentBlockTimestamp: toNullableNumber(row.payment_block_timestamp),
+    createdAt: Number(row.created_at),
   };
 }
 
@@ -1597,6 +1733,241 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     WHERE bucket_start < ?
   `);
 
+  const insertReviewInvoiceStmt = sqlite.prepare(`
+    INSERT INTO review_invoices (
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_address,
+      expected_paid_sats,
+      verifier_sats,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at,
+      published_review_id
+    ) VALUES (
+      @invoiceId,
+      @tokenId,
+      @authorAddress,
+      @score,
+      @commentText,
+      @paymentAddress,
+      @expectedPaidSats,
+      @verifierSats,
+      'pending',
+      NULL,
+      @expiresAt,
+      @createdAt,
+      @createdAt,
+      NULL
+    )
+  `);
+
+  const getReviewInvoiceStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_address,
+      expected_paid_sats,
+      verifier_sats,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at,
+      published_review_id
+    FROM review_invoices
+    WHERE invoice_id = ?
+  `);
+
+  const getReviewInvoiceByPaymentTxidStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_address,
+      expected_paid_sats,
+      verifier_sats,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at,
+      published_review_id
+    FROM review_invoices
+    WHERE payment_txid = ?
+  `);
+
+  const markReviewInvoiceTxSubmittedStmt = sqlite.prepare(`
+    UPDATE review_invoices
+    SET
+      status = 'tx_submitted',
+      payment_txid = ?,
+      updated_at = ?
+    WHERE invoice_id = ?
+  `);
+
+  const markReviewInvoiceInvalidStmt = sqlite.prepare(`
+    UPDATE review_invoices
+    SET
+      status = 'invalid',
+      updated_at = ?
+    WHERE invoice_id = ?
+  `);
+
+  const expireReviewInvoicesStmt = sqlite.prepare(`
+    UPDATE review_invoices
+    SET
+      status = 'expired',
+      updated_at = ?
+    WHERE status IN ('pending', 'tx_submitted')
+      AND expires_at <= ?
+  `);
+
+  const listSubmittedReviewInvoicesStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_address,
+      expected_paid_sats,
+      verifier_sats,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at,
+      published_review_id
+    FROM review_invoices
+    WHERE status = 'tx_submitted'
+      AND payment_txid IS NOT NULL
+      AND expires_at > ?
+    ORDER BY updated_at ASC, created_at ASC
+    LIMIT ?
+  `);
+
+  const insertTokenReviewStmt = sqlite.prepare(`
+    INSERT INTO token_reviews (
+      review_id,
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_txid,
+      paid_sats,
+      payment_seen_at,
+      payment_block_height,
+      payment_block_timestamp,
+      created_at
+    ) VALUES (
+      @reviewId,
+      @invoiceId,
+      @tokenId,
+      @authorAddress,
+      @score,
+      @commentText,
+      @paymentTxid,
+      @paidSats,
+      @paymentSeenAt,
+      @paymentBlockHeight,
+      @paymentBlockTimestamp,
+      @createdAt
+    )
+  `);
+
+  const markReviewInvoicePublishedStmt = sqlite.prepare(`
+    UPDATE review_invoices
+    SET
+      status = 'published',
+      updated_at = ?,
+      published_review_id = ?
+    WHERE invoice_id = ?
+  `);
+
+  const getTokenReviewStmt = sqlite.prepare(`
+    SELECT
+      review_id,
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_txid,
+      paid_sats,
+      payment_seen_at,
+      payment_block_height,
+      payment_block_timestamp,
+      created_at
+    FROM token_reviews
+    WHERE review_id = ?
+  `);
+
+  const countTokenReviewsStmt = sqlite.prepare(`
+    SELECT COUNT(*) AS count
+    FROM token_reviews
+    WHERE token_id = ?
+  `);
+
+  const listTokenReviewsStmt = sqlite.prepare(`
+    SELECT
+      review_id,
+      invoice_id,
+      token_id,
+      author_address,
+      score,
+      comment_text,
+      payment_txid,
+      paid_sats,
+      payment_seen_at,
+      payment_block_height,
+      payment_block_timestamp,
+      created_at
+    FROM token_reviews
+    WHERE token_id = ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT ?
+    OFFSET ?
+  `);
+
+  const getTokenReviewTotalsStmt = sqlite.prepare(`
+    SELECT
+      COUNT(*) AS review_count_total,
+      COALESCE(SUM(CASE WHEN comment_text <> '' THEN 1 ELSE 0 END), 0) AS comment_count_total,
+      MAX(created_at) AS last_review_at
+    FROM token_reviews
+    WHERE token_id = ?
+  `);
+
+  const getTokenReviewLatestScoreSummaryStmt = sqlite.prepare(`
+    WITH ranked AS (
+      SELECT
+        score,
+        ROW_NUMBER() OVER (
+          PARTITION BY author_address
+          ORDER BY created_at DESC, rowid DESC
+        ) AS row_rank
+      FROM token_reviews
+      WHERE token_id = ?
+    )
+    SELECT
+      AVG(score) AS average_score,
+      COUNT(*) AS scorer_count
+    FROM ranked
+    WHERE row_rank = 1
+  `);
+
   const recordApiAccessTx = sqlite.transaction((entry: ApiAccessRecord) => {
     const occurredAtMs = entry.occurredAtMs ?? Date.now();
     const bucketStart = startOfHourMs(occurredAtMs);
@@ -1680,6 +2051,33 @@ export function openDatabase(sqlitePath: string): AppDatabase {
 
     return inserted;
   });
+
+  const publishTokenReviewTx = sqlite.transaction(
+    (review: PublishTokenReviewRecord, updatedAt: number) => {
+      insertTokenReviewStmt.run(review);
+      markReviewInvoicePublishedStmt.run(
+        updatedAt,
+        review.reviewId,
+        review.invoiceId,
+      );
+
+      const invoiceRow = getReviewInvoiceStmt.get(review.invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      const reviewRow = getTokenReviewStmt.get(review.reviewId) as
+        | Record<string, unknown>
+        | undefined;
+
+      if (!invoiceRow || !reviewRow) {
+        throw new Error("published review transaction did not return inserted rows");
+      }
+
+      return {
+        invoice: toReviewInvoiceRecord(invoiceRow),
+        review: toTokenReviewRecord(reviewRow),
+      };
+    },
+  );
 
   const recomputeTokenAggregateStatsTx = sqlite.transaction(
     (tokenId: string, chainTipHeight: number) => {
@@ -2182,6 +2580,88 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       readTokenVisitAnalytics(options.tokenId, options.hours, options.nowMs),
     getTokenVisitSnapshot: (tokenId, nowMs) =>
       readTokenVisitSnapshot(tokenId, nowMs),
+    createReviewInvoice: (invoice) => {
+      insertReviewInvoiceStmt.run(invoice);
+      const row = getReviewInvoiceStmt.get(invoice.invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      if (!row) {
+        throw new Error("created review invoice could not be read back");
+      }
+      return toReviewInvoiceRecord(row);
+    },
+    getReviewInvoice: (invoiceId) => {
+      const row = getReviewInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toReviewInvoiceRecord(row) : null;
+    },
+    getReviewInvoiceByPaymentTxid: (txid) => {
+      const row = getReviewInvoiceByPaymentTxidStmt.get(txid) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toReviewInvoiceRecord(row) : null;
+    },
+    markReviewInvoiceTxSubmitted: (invoiceId, txid, updatedAt) => {
+      markReviewInvoiceTxSubmittedStmt.run(txid, updatedAt, invoiceId);
+      const row = getReviewInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toReviewInvoiceRecord(row) : null;
+    },
+    markReviewInvoiceInvalid: (invoiceId, updatedAt) => {
+      markReviewInvoiceInvalidStmt.run(updatedAt, invoiceId);
+      const row = getReviewInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toReviewInvoiceRecord(row) : null;
+    },
+    expireReviewInvoices: (nowMs = Date.now()) =>
+      expireReviewInvoicesStmt.run(nowMs, nowMs).changes,
+    listSubmittedReviewInvoices: (nowMs, limit) =>
+      (
+        listSubmittedReviewInvoicesStmt.all(nowMs, limit) as Array<
+          Record<string, unknown>
+        >
+      ).map(toReviewInvoiceRecord),
+    publishTokenReview: (review, updatedAt) =>
+      publishTokenReviewTx(review, updatedAt),
+    listTokenReviews: (options) => {
+      const totalRow = countTokenReviewsStmt.get(options.tokenId) as {
+        count: number;
+      };
+      const rows = listTokenReviewsStmt.all(
+        options.tokenId,
+        options.pageSize,
+        options.offset,
+      ) as Array<Record<string, unknown>>;
+      return {
+        page: options.page,
+        pageSize: options.pageSize,
+        total: totalRow.count,
+        items: rows.map(toTokenReviewRecord),
+      };
+    },
+    getTokenReviewSummary: (tokenId) => {
+      const totals = getTokenReviewTotalsStmt.get(tokenId) as
+        | Record<string, unknown>
+        | undefined;
+      const latestScoreSummary = getTokenReviewLatestScoreSummaryStmt.get(
+        tokenId,
+      ) as Record<string, unknown> | undefined;
+
+      const scorerCount = Number(latestScoreSummary?.scorer_count ?? 0);
+      return {
+        averageScore:
+          scorerCount === 0
+            ? null
+            : Number(latestScoreSummary?.average_score ?? 0),
+        scorerCount,
+        reviewCountTotal: Number(totals?.review_count_total ?? 0),
+        commentCountTotal: Number(totals?.comment_count_total ?? 0),
+        lastReviewAt: toNullableNumber(totals?.last_review_at),
+      };
+    },
     pruneOldAnalyticsBuckets: (retentionHours, nowMs = Date.now()) => {
       const cutoffBucketStart = retentionCutoffBucketStartMs(nowMs, retentionHours);
       return {
