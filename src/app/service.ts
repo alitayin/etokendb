@@ -37,8 +37,7 @@ import {
   type TokenReviewRecord,
 } from "../lib/reviews.js";
 import {
-  PROJECT_INFO_INITIAL_FEE_SATS,
-  PROJECT_INFO_UPDATE_FEE_SATS,
+  getProjectInfoFeeSats,
   normalizeProjectInfoFields,
   verifyProjectInfoPaymentTx,
   type ProjectInfoInvoiceRecord,
@@ -936,9 +935,10 @@ export class AgoraTokenService implements ServiceReadApi {
 
     const nowMs = this.nowMs();
     const feeTier = existingInfo ? "update" : "initial";
-    const expectedPaidSats = existingInfo
-      ? PROJECT_INFO_UPDATE_FEE_SATS
-      : PROJECT_INFO_INITIAL_FEE_SATS;
+    const expectedPaidSats = getProjectInfoFeeSats(
+      normalizedTokenId,
+      existingInfo !== null,
+    );
 
     return toProjectInfoInvoice(
       this.db.createProjectInfoInvoice({

@@ -10,6 +10,9 @@ export const PROJECT_INFO_DESCRIPTION_MAX_BYTES = 1000;
 export const PROJECT_INFO_URL_MAX_CHARS = 500;
 export const PROJECT_INFO_INITIAL_FEE_SATS = 100_000_000;
 export const PROJECT_INFO_UPDATE_FEE_SATS = 10_000_000;
+export const PROJECT_INFO_TEST_TOKEN_ID =
+  "5cb20c6cdeaee3abf53f7dcaaa1092ad10a0e2e9dcd94ee07272b631e65d7371";
+export const PROJECT_INFO_TEST_FEE_SATS = 10_000;
 
 export type ProjectInfoInvoiceStatus =
   | "pending"
@@ -82,6 +85,18 @@ export interface ProjectInfoPaymentVerification {
   paymentSeenAt: number;
   paymentBlockHeight: number | null;
   paymentBlockTimestamp: number | null;
+}
+
+export function getProjectInfoFeeSats(
+  tokenId: string,
+  hasExistingInfo: boolean,
+): number {
+  if (tokenId.toLowerCase() === PROJECT_INFO_TEST_TOKEN_ID) {
+    return PROJECT_INFO_TEST_FEE_SATS;
+  }
+  return hasExistingInfo
+    ? PROJECT_INFO_UPDATE_FEE_SATS
+    : PROJECT_INFO_INITIAL_FEE_SATS;
 }
 
 function normalizeStringField(value: unknown, fieldName: string): string {

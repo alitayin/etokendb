@@ -73,6 +73,8 @@ const OTHER_REVIEW_ADDRESS = encodeOutputScript(
 );
 const REVIEW_TOKEN_ID = "d".repeat(64);
 const PROJECT_TOKEN_ID = "e".repeat(64);
+const PROJECT_INFO_TEST_TOKEN_ID =
+  "5cb20c6cdeaee3abf53f7dcaaa1092ad10a0e2e9dcd94ee07272b631e65d7371";
 const PROJECT_AUTH_PUBKEY =
   "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const PROJECT_EDITOR_ADDRESS =
@@ -701,6 +703,50 @@ test("project info invoices use initial fee then update fee", async () => {
     });
     assert.equal(update.expectedPaidSats, 10_000_000);
     assert.equal(update.expectedPaidXec, "100000.00");
+    assert.equal(update.feeTier, "update");
+  } finally {
+    db.close();
+  }
+});
+
+test("project info test token invoices use 100 XEC for initial and update fees", async () => {
+  const firstTxid = "5".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(
+    firstTxid,
+    makeTx({
+      txid: firstTxid,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
+      paidSats: 10_000n,
+    }),
+  );
+
+  try {
+    const first = await service.createProjectInfoInvoice(
+      PROJECT_INFO_TEST_TOKEN_ID,
+      {
+        editorAddress: PROJECT_EDITOR_ADDRESS,
+        description: "Test project",
+      },
+    );
+    assert.equal(first.expectedPaidSats, 10_000);
+    assert.equal(first.expectedPaidXec, "100.00");
+    assert.equal(first.feeTier, "initial");
+
+    const published = await service.submitProjectInfoInvoiceTx(first.invoiceId, {
+      txid: firstTxid,
+    });
+    assert.equal(published.status, "published");
+
+    const update = await service.createProjectInfoInvoice(
+      PROJECT_INFO_TEST_TOKEN_ID,
+      {
+        editorAddress: PROJECT_EDITOR_ADDRESS,
+        description: "Updated test project",
+      },
+    );
+    assert.equal(update.expectedPaidSats, 10_000);
+    assert.equal(update.expectedPaidXec, "100.00");
     assert.equal(update.feeTier, "update");
   } finally {
     db.close();
