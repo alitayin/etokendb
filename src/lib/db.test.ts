@@ -1074,3 +1074,195 @@ test("review invoice payment txids are unique", () => {
     db.close();
   }
 });
+
+test("project info invoices publish and upsert current token info", () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "d".repeat(64);
+  const editorAddress = "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";
+  const paymentAddress = "ecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd9f6zcr";
+
+  try {
+    const invoice = db.createProjectInfoInvoice({
+      invoiceId: "project-info-invoice-1",
+      tokenId,
+      editorAddress,
+      description: "First description",
+      websiteUrl: "https://example.com/",
+      xUrl: "https://x.com/project",
+      telegramUrl: "https://t.me/project",
+      paymentAddress,
+      expectedPaidSats: 100_000_000,
+      feeTier: "initial",
+      expiresAt: 2_000,
+      createdAt: 1_000,
+    });
+    assert.equal(invoice.status, "pending");
+    assert.equal(db.getTokenProjectInfo(tokenId), null);
+
+    db.markProjectInfoInvoiceTxSubmitted(
+      invoice.invoiceId,
+      "5".repeat(64),
+      1_100,
+    );
+    const published = db.publishTokenProjectInfo(
+      {
+        invoiceId: invoice.invoiceId,
+        tokenId,
+        editorAddress,
+        description: "First description",
+        websiteUrl: "https://example.com/",
+        xUrl: "https://x.com/project",
+        telegramUrl: "https://t.me/project",
+        paymentTxid: "5".repeat(64),
+        paidSats: 100_000_000,
+        paymentSeenAt: 1_200,
+        paymentBlockHeight: null,
+        paymentBlockTimestamp: null,
+        updatedAt: 1_300,
+      },
+      1_300,
+    );
+
+    assert.equal(published.invoice.status, "published");
+    assert.deepEqual(db.getTokenProjectInfo(tokenId), {
+      tokenId,
+      description: "First description",
+      websiteUrl: "https://example.com/",
+      xUrl: "https://x.com/project",
+      telegramUrl: "https://t.me/project",
+      createdAt: 1_300,
+      updatedAt: 1_300,
+      updateCount: 1,
+      lastEditorAddress: editorAddress,
+      lastPaymentTxid: "5".repeat(64),
+      lastPaidSats: 100_000_000,
+      lastPaymentSeenAt: 1_200,
+      lastPaymentBlockHeight: null,
+      lastPaymentBlockTimestamp: null,
+    });
+
+    db.createProjectInfoInvoice({
+      invoiceId: "project-info-invoice-2",
+      tokenId,
+      editorAddress,
+      description: "",
+      websiteUrl: null,
+      xUrl: null,
+      telegramUrl: null,
+      paymentAddress,
+      expectedPaidSats: 10_000_000,
+      feeTier: "update",
+      expiresAt: 4_000,
+      createdAt: 3_000,
+    });
+    db.markProjectInfoInvoiceTxSubmitted(
+      "project-info-invoice-2",
+      "6".repeat(64),
+      3_100,
+    );
+    db.publishTokenProjectInfo(
+      {
+        invoiceId: "project-info-invoice-2",
+        tokenId,
+        editorAddress,
+        description: "",
+        websiteUrl: null,
+        xUrl: null,
+        telegramUrl: null,
+        paymentTxid: "6".repeat(64),
+        paidSats: 10_000_000,
+        paymentSeenAt: 3_200,
+        paymentBlockHeight: 900_000,
+        paymentBlockTimestamp: 1_700_000_000,
+        updatedAt: 3_300,
+      },
+      3_300,
+    );
+
+    const updated = db.getTokenProjectInfo(tokenId);
+    assert.equal(updated?.description, "");
+    assert.equal(updated?.websiteUrl, null);
+    assert.equal(updated?.updateCount, 2);
+    assert.equal(updated?.createdAt, 1_300);
+    assert.equal(updated?.updatedAt, 3_300);
+    assert.equal(updated?.lastPaidSats, 10_000_000);
+    assert.equal(updated?.lastPaymentBlockHeight, 900_000);
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoices expire and payment txids are unique", () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "e".repeat(64);
+  const editorAddress = "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";
+  const paymentAddress = "ecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd9f6zcr";
+  const txid = "7".repeat(64);
+
+  try {
+    for (const invoiceId of ["project-info-invoice-a", "project-info-invoice-b"]) {
+      db.createProjectInfoInvoice({
+        invoiceId,
+        tokenId,
+        editorAddress,
+        description: "Project",
+        websiteUrl: null,
+        xUrl: null,
+        telegramUrl: null,
+        paymentAddress,
+        expectedPaidSats: 100_000_000,
+        feeTier: "initial",
+        expiresAt: 2_000,
+        createdAt: 1_000,
+      });
+    }
+
+    assert.equal(db.expireProjectInfoInvoices(1_999), 0);
+    assert.equal(db.expireProjectInfoInvoices(2_000), 2);
+    assert.equal(
+      db.getProjectInfoInvoice("project-info-invoice-a")?.status,
+      "expired",
+    );
+
+    const later = db.createProjectInfoInvoice({
+      invoiceId: "project-info-invoice-c",
+      tokenId,
+      editorAddress,
+      description: "Project",
+      websiteUrl: null,
+      xUrl: null,
+      telegramUrl: null,
+      paymentAddress,
+      expectedPaidSats: 100_000_000,
+      feeTier: "initial",
+      expiresAt: 4_000,
+      createdAt: 3_000,
+    });
+    assert.equal(later.status, "pending");
+    db.createProjectInfoInvoice({
+      invoiceId: "project-info-invoice-d",
+      tokenId,
+      editorAddress,
+      description: "Project",
+      websiteUrl: null,
+      xUrl: null,
+      telegramUrl: null,
+      paymentAddress,
+      expectedPaidSats: 100_000_000,
+      feeTier: "initial",
+      expiresAt: 4_000,
+      createdAt: 3_000,
+    });
+
+    db.markProjectInfoInvoiceTxSubmitted(later.invoiceId, txid, 3_100);
+    assert.throws(() =>
+      db.markProjectInfoInvoiceTxSubmitted(
+        "project-info-invoice-d",
+        txid,
+        3_200,
+      ),
+    );
+  } finally {
+    db.close();
+  }
+});

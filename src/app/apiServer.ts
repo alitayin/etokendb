@@ -15,8 +15,10 @@ import {
 import { ReviewError } from "../lib/reviews.js";
 import type {
   CandleInterval,
+  CreateProjectInfoInvoiceInput,
   CreateReviewInvoiceInput,
   ServiceReadApi,
+  SubmitProjectInfoInvoiceTxInput,
   SubmitReviewInvoiceTxInput,
   TokenListQuery,
   TokenCandleQuery,
@@ -225,12 +227,58 @@ function classifyBusinessRoute(segments: string[]): BusinessRouteMatch | null {
   }
 
   if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "project-info"
+  ) {
+    return {
+      routeKey: "tokens.project-info.detail",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "project-info" &&
+    segments[4] === "invoices"
+  ) {
+    return {
+      routeKey: "tokens.project-info-invoices.create",
+      tokenId: segments[2],
+    };
+  }
+
+  if (
     segments.length === 3 &&
     segments[0] === "api" &&
     segments[1] === "review-invoices"
   ) {
     return {
       routeKey: "review-invoices.detail",
+    };
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "project-info-invoices"
+  ) {
+    return {
+      routeKey: "project-info-invoices.detail",
+    };
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "project-info-invoices" &&
+    segments[3] === "submit-tx"
+  ) {
+    return {
+      routeKey: "project-info-invoices.submit-tx",
     };
   }
 
@@ -356,16 +404,25 @@ function methodNotAllowed(res: ServerResponse, allowedMethod = "GET"): void {
   });
 }
 
-function isAllowedReviewPostRoute(segments: string[]): boolean {
+function isAllowedPaidPostRoute(segments: string[]): boolean {
   return (
     (segments.length === 5 &&
       segments[0] === "api" &&
       segments[1] === "tokens" &&
       segments[3] === "reviews" &&
       segments[4] === "invoices") ||
+    (segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "tokens" &&
+      segments[3] === "project-info" &&
+      segments[4] === "invoices") ||
     (segments.length === 4 &&
       segments[0] === "api" &&
       segments[1] === "review-invoices" &&
+      segments[3] === "submit-tx") ||
+    (segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "project-info-invoices" &&
       segments[3] === "submit-tx")
   );
 }
@@ -454,7 +511,7 @@ async function routeRequest(
 
   if (
     req.method !== "GET" &&
-    !(req.method === "POST" && isAllowedReviewPostRoute(segments))
+    !(req.method === "POST" && isAllowedPaidPostRoute(segments))
   ) {
     methodNotAllowed(res);
     return;
@@ -481,6 +538,60 @@ async function routeRequest(
       data: {
         ready,
       },
+    });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "project-info"
+  ) {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.getTokenProjectInfo(segments[2]),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "tokens" &&
+    segments[3] === "project-info" &&
+    segments[4] === "invoices"
+  ) {
+    if (!requireMethod(req, res, "POST")) {
+      return;
+    }
+    const body = await readJsonObjectBody(req);
+    const input: CreateProjectInfoInvoiceInput = {
+      editorAddress:
+        typeof body.editorAddress === "string" ? body.editorAddress : "",
+      description:
+        body.description === undefined || body.description === null
+          ? undefined
+          : (body.description as string),
+      websiteUrl:
+        body.websiteUrl === undefined || body.websiteUrl === null
+          ? undefined
+          : (body.websiteUrl as string),
+      xUrl:
+        body.xUrl === undefined || body.xUrl === null
+          ? undefined
+          : (body.xUrl as string),
+      telegramUrl:
+        body.telegramUrl === undefined || body.telegramUrl === null
+          ? undefined
+          : (body.telegramUrl as string),
+    };
+    sendJson(res, 201, {
+      ok: true,
+      data: await dataService.createProjectInfoInvoice(segments[2], input),
     });
     return;
   }
@@ -816,6 +927,46 @@ async function routeRequest(
     sendJson(res, 200, {
       ok: true,
       data: await dataService.submitReviewInvoiceTx(segments[2], input),
+    });
+    return;
+  }
+
+  if (
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "project-info-invoices"
+  ) {
+    if (!requireMethod(req, res, "GET")) {
+      return;
+    }
+    const invoice = await dataService.getProjectInfoInvoice(segments[2]);
+    if (!invoice) {
+      throw new ApiHttpError(
+        404,
+        "INVOICE_NOT_FOUND",
+        "Project info invoice not found",
+      );
+    }
+    sendJson(res, 200, { ok: true, data: invoice });
+    return;
+  }
+
+  if (
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "project-info-invoices" &&
+    segments[3] === "submit-tx"
+  ) {
+    if (!requireMethod(req, res, "POST")) {
+      return;
+    }
+    const body = await readJsonObjectBody(req);
+    const input: SubmitProjectInfoInvoiceTxInput = {
+      txid: typeof body.txid === "string" ? body.txid : "",
+    };
+    sendJson(res, 200, {
+      ok: true,
+      data: await dataService.submitProjectInfoInvoiceTx(segments[2], input),
     });
     return;
   }

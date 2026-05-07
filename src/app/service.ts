@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { randomInt, randomUUID } from "node:crypto";
 
-import type { Tx, WsEndpoint, WsMsgClient } from "chronik-client";
+import type { ChronikClient, Tx, WsEndpoint, WsMsgClient } from "chronik-client";
 
 import {
   discoverActiveTokens,
@@ -35,12 +35,24 @@ import {
   type ReviewInvoiceRecord,
   type TokenReviewRecord,
 } from "../lib/reviews.js";
+import {
+  PROJECT_INFO_INITIAL_FEE_SATS,
+  PROJECT_INFO_UPDATE_FEE_SATS,
+  addressOwnsMintBaton,
+  normalizeProjectInfoFields,
+  verifyProjectInfoPaymentTx,
+  type ChronikMintBatonUtxosClient,
+  type ProjectInfoInvoiceRecord,
+  type TokenProjectInfoRecord,
+} from "../lib/projectInfo.js";
 import type { ActiveTokenSeed } from "../lib/types.js";
 import type {
   AnalyticsSummary,
+  CreateProjectInfoInvoiceInput,
   CreateReviewInvoiceInput,
   EndpointAnalyticsDetail,
   EndpointAnalyticsSummary,
+  ProjectInfoInvoice,
   TokenCandle,
   TokenCandlesResult,
   TokenCandleQuery,
@@ -48,9 +60,11 @@ import type {
   PaginatedResult,
   ServiceReadApi,
   ServiceStatus,
+  SubmitProjectInfoInvoiceTxInput,
   SubmitReviewInvoiceTxInput,
   TokenDetail,
   TokenListQuery,
+  TokenProjectInfo,
   TokenReviewItem,
   TokenReviewSummary,
   TokenSortField,
@@ -64,6 +78,10 @@ import type {
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
 const CANDLE_TIMEZONE = "Asia/Shanghai";
+
+type ProjectInfoDependencies = SyncDependencies & {
+  chronik: SyncDependencies["chronik"] & Partial<Pick<ChronikClient, "address">>;
+};
 
 type TokenPhase = "pending" | "initializing" | "catching-up" | "ready" | "error";
 
@@ -102,6 +120,7 @@ export interface AgoraTokenServiceOptions {
   reviewInvoiceIdFactory?: () => string;
   reviewIdFactory?: () => string;
   reviewVerifierSatsFactory?: () => number;
+  projectInfoInvoiceIdFactory?: () => string;
 }
 
 function toIso(timestampMs: number | null): string | null {
@@ -385,6 +404,41 @@ function toTokenReviewItem(record: TokenReviewRecord): TokenReviewItem {
   };
 }
 
+function toTokenProjectInfo(record: TokenProjectInfoRecord): TokenProjectInfo {
+  return {
+    tokenId: record.tokenId,
+    description: record.description,
+    websiteUrl: record.websiteUrl,
+    xUrl: record.xUrl,
+    telegramUrl: record.telegramUrl,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    updateCount: record.updateCount,
+    lastEditorMasked: maskEcashAddress(record.lastEditorAddress),
+  };
+}
+
+function toProjectInfoInvoice(
+  record: ProjectInfoInvoiceRecord,
+): ProjectInfoInvoice {
+  return {
+    invoiceId: record.invoiceId,
+    tokenId: record.tokenId,
+    editorAddress: record.editorAddress,
+    description: record.description,
+    websiteUrl: record.websiteUrl,
+    xUrl: record.xUrl,
+    telegramUrl: record.telegramUrl,
+    paymentAddress: record.paymentAddress,
+    expectedPaidSats: record.expectedPaidSats,
+    expectedPaidXec: satsToXecString(record.expectedPaidSats),
+    feeTier: record.feeTier,
+    status: record.status,
+    expiresAt: record.expiresAt,
+    paymentTxid: record.paymentTxid,
+  };
+}
+
 export class AgoraTokenService implements ServiceReadApi {
   private readonly logger: Logger;
   private readonly ops: CoordinatorOps;
@@ -400,6 +454,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private pollingTailTimer: NodeJS.Timeout | null = null;
   private analyticsPruneTimer: NodeJS.Timeout | null = null;
   private reviewRetryTimer: NodeJS.Timeout | null = null;
+  private projectInfoRetryTimer: NodeJS.Timeout | null = null;
   private workerCount = 0;
   private startedAt = Date.now();
   private phase: ServiceStatus["phase"] = "starting";
@@ -417,10 +472,11 @@ export class AgoraTokenService implements ServiceReadApi {
   private readonly reviewInvoiceIdFactory: () => string;
   private readonly reviewIdFactory: () => string;
   private readonly reviewVerifierSatsFactory: () => number;
+  private readonly projectInfoInvoiceIdFactory: () => string;
 
   constructor(
     private readonly db: AppDatabase,
-    private readonly deps: SyncDependencies,
+    private readonly deps: ProjectInfoDependencies,
     private readonly config: AppConfig,
     options?: AgoraTokenServiceOptions,
   ) {
@@ -442,6 +498,8 @@ export class AgoraTokenService implements ServiceReadApi {
           REVIEW_INVOICE_VERIFIER_MIN_SATS,
           REVIEW_INVOICE_VERIFIER_MAX_SATS + 1,
         ));
+    this.projectInfoInvoiceIdFactory =
+      options?.projectInfoInvoiceIdFactory ?? randomUUID;
   }
 
   async start(): Promise<void> {
@@ -487,6 +545,10 @@ export class AgoraTokenService implements ServiceReadApi {
     if (this.reviewRetryTimer) {
       clearInterval(this.reviewRetryTimer);
       this.reviewRetryTimer = null;
+    }
+    if (this.projectInfoRetryTimer) {
+      clearInterval(this.projectInfoRetryTimer);
+      this.projectInfoRetryTimer = null;
     }
     if (this.ws) {
       this.ws.close();
@@ -797,6 +859,11 @@ export class AgoraTokenService implements ServiceReadApi {
     return this.db.getTokenReviewSummary(normalizeTokenId(tokenId));
   }
 
+  getTokenProjectInfo(tokenId: string): TokenProjectInfo | null {
+    const info = this.db.getTokenProjectInfo(normalizeTokenId(tokenId));
+    return info ? toTokenProjectInfo(info) : null;
+  }
+
   createReviewInvoice(
     tokenId: string,
     input: CreateReviewInvoiceInput,
@@ -855,8 +922,81 @@ export class AgoraTokenService implements ServiceReadApi {
     return toReviewInvoice(published ?? submittedInvoice);
   }
 
+  async createProjectInfoInvoice(
+    tokenId: string,
+    input: CreateProjectInfoInvoiceInput,
+  ) {
+    const paymentAddress = this.requireProjectInfoPaymentAddress();
+    const normalizedTokenId = normalizeTokenId(tokenId);
+    const editorAddress = normalizeEcashAddress(
+      input.editorAddress,
+      "editorAddress",
+    );
+    const existingInfo = this.db.getTokenProjectInfo(normalizedTokenId);
+    const fields = normalizeProjectInfoFields(input, {
+      allowEmpty: existingInfo !== null,
+    });
+
+    await this.requireMintBatonOwner(normalizedTokenId, editorAddress);
+
+    const nowMs = this.nowMs();
+    const feeTier = existingInfo ? "update" : "initial";
+    const expectedPaidSats = existingInfo
+      ? PROJECT_INFO_UPDATE_FEE_SATS
+      : PROJECT_INFO_INITIAL_FEE_SATS;
+
+    return toProjectInfoInvoice(
+      this.db.createProjectInfoInvoice({
+        invoiceId: this.projectInfoInvoiceIdFactory(),
+        tokenId: normalizedTokenId,
+        editorAddress,
+        ...fields,
+        paymentAddress,
+        expectedPaidSats,
+        feeTier,
+        expiresAt: nowMs + this.config.reviewInvoiceTtlMs,
+        createdAt: nowMs,
+      }),
+    );
+  }
+
+  getProjectInfoInvoice(invoiceId: string) {
+    const invoice = this.db.getProjectInfoInvoice(invoiceId);
+    return invoice ? toProjectInfoInvoice(invoice) : null;
+  }
+
+  async submitProjectInfoInvoiceTx(
+    invoiceId: string,
+    input: SubmitProjectInfoInvoiceTxInput,
+  ) {
+    const txid = normalizeTxid(input.txid);
+    const invoice = this.getOpenProjectInfoInvoice(invoiceId);
+    this.ensureProjectInfoPaymentTxidAvailable(txid, invoice.invoiceId);
+
+    const nowMs = this.nowMs();
+    const submittedInvoice =
+      this.db.markProjectInfoInvoiceTxSubmitted(
+        invoice.invoiceId,
+        txid,
+        nowMs,
+      ) ?? invoice;
+
+    const published = await this.tryPublishProjectInfoPayment(
+      submittedInvoice,
+      nowMs,
+      {
+        throwOnInvalid: true,
+      },
+    );
+    return toProjectInfoInvoice(published ?? submittedInvoice);
+  }
+
   expireReviewInvoices(nowMs = this.nowMs()): number {
     return this.db.expireReviewInvoices(nowMs);
+  }
+
+  expireProjectInfoInvoices(nowMs = this.nowMs()): number {
+    return this.db.expireProjectInfoInvoices(nowMs);
   }
 
   async retryPendingReviewPayments(limit = 50): Promise<{
@@ -873,6 +1013,38 @@ export class AgoraTokenService implements ServiceReadApi {
 
     for (const invoice of invoices) {
       const result = await this.tryPublishReviewPayment(invoice, nowMs);
+      if (!result) {
+        continue;
+      }
+      if (result.status === "published") {
+        published += 1;
+      } else if (result.status === "invalid") {
+        invalid += 1;
+      }
+    }
+
+    return {
+      checked: invoices.length,
+      published,
+      invalid,
+      expired,
+    };
+  }
+
+  async retryPendingProjectInfoPayments(limit = 50): Promise<{
+    checked: number;
+    published: number;
+    invalid: number;
+    expired: number;
+  }> {
+    const nowMs = this.nowMs();
+    const expired = this.expireProjectInfoInvoices(nowMs);
+    const invoices = this.db.listSubmittedProjectInfoInvoices(nowMs, limit);
+    let published = 0;
+    let invalid = 0;
+
+    for (const invoice of invoices) {
+      const result = await this.tryPublishProjectInfoPayment(invoice, nowMs);
       if (!result) {
         continue;
       }
@@ -912,6 +1084,45 @@ export class AgoraTokenService implements ServiceReadApi {
     }
   }
 
+  private requireProjectInfoPaymentAddress(): string {
+    const rawAddress = this.config.projectInfoPaymentAddress;
+    if (!rawAddress) {
+      throw new ReviewError(
+        503,
+        "PROJECT_INFO_PAYMENTS_DISABLED",
+        "PROJECT_INFO_PAYMENT_ADDRESS is not configured",
+      );
+    }
+
+    try {
+      return normalizeEcashAddress(rawAddress, "PROJECT_INFO_PAYMENT_ADDRESS");
+    } catch {
+      throw new ReviewError(
+        503,
+        "PROJECT_INFO_PAYMENT_CONFIG_INVALID",
+        "PROJECT_INFO_PAYMENT_ADDRESS must be a valid eCash p2pkh or p2sh address",
+      );
+    }
+  }
+
+  private async requireMintBatonOwner(
+    tokenId: string,
+    editorAddress: string,
+  ): Promise<void> {
+    const ownsMintBaton = await addressOwnsMintBaton({
+      chronik: this.deps.chronik as ChronikMintBatonUtxosClient,
+      address: editorAddress,
+      tokenId,
+    });
+    if (!ownsMintBaton) {
+      throw new ReviewError(
+        403,
+        "MINT_BATON_REQUIRED",
+        "editorAddress must currently hold this token's mint baton",
+      );
+    }
+  }
+
   private getOpenReviewInvoice(invoiceId: string): ReviewInvoiceRecord {
     const invoice = this.db.getReviewInvoice(invoiceId);
     if (!invoice) {
@@ -942,6 +1153,48 @@ export class AgoraTokenService implements ServiceReadApi {
     return invoice;
   }
 
+  private getOpenProjectInfoInvoice(invoiceId: string): ProjectInfoInvoiceRecord {
+    const invoice = this.db.getProjectInfoInvoice(invoiceId);
+    if (!invoice) {
+      throw new ReviewError(
+        404,
+        "INVOICE_NOT_FOUND",
+        "Project info invoice not found",
+      );
+    }
+
+    const nowMs = this.nowMs();
+    if (
+      (invoice.status === "pending" || invoice.status === "tx_submitted") &&
+      invoice.expiresAt <= nowMs
+    ) {
+      this.db.expireProjectInfoInvoices(nowMs);
+      throw new ReviewError(
+        410,
+        "INVOICE_EXPIRED",
+        "Project info invoice has expired",
+      );
+    }
+
+    if (invoice.status === "expired") {
+      throw new ReviewError(
+        410,
+        "INVOICE_EXPIRED",
+        "Project info invoice has expired",
+      );
+    }
+
+    if (invoice.status !== "pending" && invoice.status !== "tx_submitted") {
+      throw new ReviewError(
+        409,
+        "INVOICE_NOT_OPEN",
+        `Project info invoice is ${invoice.status}`,
+      );
+    }
+
+    return invoice;
+  }
+
   private ensurePaymentTxidAvailable(txid: string, invoiceId: string): void {
     const existing = this.db.getReviewInvoiceByPaymentTxid(txid);
     if (existing && existing.invoiceId !== invoiceId) {
@@ -949,6 +1202,20 @@ export class AgoraTokenService implements ServiceReadApi {
         409,
         "PAYMENT_TXID_REUSED",
         "payment txid is already attached to another review invoice",
+      );
+    }
+  }
+
+  private ensureProjectInfoPaymentTxidAvailable(
+    txid: string,
+    invoiceId: string,
+  ): void {
+    const existing = this.db.getProjectInfoInvoiceByPaymentTxid(txid);
+    if (existing && existing.invoiceId !== invoiceId) {
+      throw new ReviewError(
+        409,
+        "PAYMENT_TXID_REUSED",
+        "payment txid is already attached to another project info invoice",
       );
     }
   }
@@ -1000,6 +1267,78 @@ export class AgoraTokenService implements ServiceReadApi {
         paymentBlockHeight: verification.paymentBlockHeight,
         paymentBlockTimestamp: verification.paymentBlockTimestamp,
         createdAt: nowMs,
+      },
+      nowMs,
+    ).invoice;
+  }
+
+  private async tryPublishProjectInfoPayment(
+    invoice: ProjectInfoInvoiceRecord,
+    nowMs: number,
+    options: { throwOnInvalid?: boolean } = {},
+  ): Promise<ProjectInfoInvoiceRecord | null> {
+    if (!invoice.paymentTxid) {
+      return null;
+    }
+
+    try {
+      await this.requireMintBatonOwner(invoice.tokenId, invoice.editorAddress);
+    } catch (error) {
+      if (
+        error instanceof ReviewError &&
+        error.code === "MINT_BATON_REQUIRED"
+      ) {
+        const invalidInvoice =
+          this.db.markProjectInfoInvoiceInvalid(invoice.invoiceId, nowMs) ??
+          invoice;
+        if (options.throwOnInvalid) {
+          throw error;
+        }
+        return invalidInvoice;
+      }
+      return null;
+    }
+
+    let tx: Tx;
+    try {
+      tx = await this.deps.chronik.tx(invoice.paymentTxid);
+    } catch {
+      return null;
+    }
+
+    let verification;
+    try {
+      verification = verifyProjectInfoPaymentTx({
+        tx,
+        txid: invoice.paymentTxid,
+        invoice,
+        nowMs,
+      });
+    } catch (error) {
+      const invalidInvoice =
+        this.db.markProjectInfoInvoiceInvalid(invoice.invoiceId, nowMs) ??
+        invoice;
+      if (options.throwOnInvalid) {
+        throw error;
+      }
+      return invalidInvoice;
+    }
+
+    return this.db.publishTokenProjectInfo(
+      {
+        invoiceId: invoice.invoiceId,
+        tokenId: invoice.tokenId,
+        editorAddress: invoice.editorAddress,
+        description: invoice.description,
+        websiteUrl: invoice.websiteUrl,
+        xUrl: invoice.xUrl,
+        telegramUrl: invoice.telegramUrl,
+        paymentTxid: invoice.paymentTxid,
+        paidSats: verification.paidSats,
+        paymentSeenAt: verification.paymentSeenAt,
+        paymentBlockHeight: verification.paymentBlockHeight,
+        paymentBlockTimestamp: verification.paymentBlockTimestamp,
+        updatedAt: nowMs,
       },
       nowMs,
     ).invoice;
@@ -1061,6 +1400,14 @@ export class AgoraTokenService implements ServiceReadApi {
       void this.retryPendingReviewPayments().catch((error) => {
         this.logger.warn(
           `review payment retry failed | error=${this.formatError(error)}`,
+        );
+      });
+    }, this.config.reviewRetryIntervalMs);
+
+    this.projectInfoRetryTimer = setInterval(() => {
+      void this.retryPendingProjectInfoPayments().catch((error) => {
+        this.logger.warn(
+          `project info payment retry failed | error=${this.formatError(error)}`,
         );
       });
     }, this.config.reviewRetryIntervalMs);

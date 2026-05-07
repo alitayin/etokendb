@@ -25,6 +25,7 @@ export interface AppConfig {
   reviewBaseFeeSats: number;
   reviewInvoiceTtlMs: number;
   reviewRetryIntervalMs: number;
+  projectInfoPaymentAddress: string | null;
   requestTimeoutMs: number;
   requestRetryCount: number;
   wsConnectTimeoutMs: number;
@@ -99,6 +100,10 @@ export function loadConfig(): AppConfig {
       "REVIEW_RETRY_INTERVAL_MS",
       REVIEW_DEFAULT_RETRY_INTERVAL_MS,
     ),
+    projectInfoPaymentAddress:
+      process.env.PROJECT_INFO_PAYMENT_ADDRESS?.trim() ||
+      process.env.REVIEW_PAYMENT_ADDRESS?.trim() ||
+      null,
     requestTimeoutMs: readPositiveInt("REQUEST_TIMEOUT_MS", 20_000),
     requestRetryCount: readPositiveInt("REQUEST_RETRY_COUNT", 3),
     wsConnectTimeoutMs: readPositiveInt("WS_CONNECT_TIMEOUT_MS", 10_000),

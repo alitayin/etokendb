@@ -11,7 +11,7 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 
 ## General behavior
 
-- Public endpoints are `GET` only except the review invoice routes documented below.
+- Public endpoints are `GET` only except the paid invoice routes documented below.
 - Unsupported methods return `405 METHOD_NOT_ALLOWED`.
 - Success responses use this envelope:
 
@@ -66,8 +66,16 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 - `INVALID_TXID`
 - `INVOICE_NOT_FOUND`
 - `INVOICE_EXPIRED`
+- `PAYMENT_AUTHOR_MISMATCH`
 - `PAYMENT_TXID_REUSED`
 - `PAYMENT_OUTPUT_MISMATCH`
+- `PROJECT_INFO_EMPTY`
+- `PROJECT_INFO_DESCRIPTION_TOO_LONG`
+- `PROJECT_INFO_URL_TOO_LONG`
+- `INVALID_PROJECT_INFO_URL`
+- `PROJECT_INFO_PAYMENTS_DISABLED`
+- `PROJECT_INFO_PAYMENT_CONFIG_INVALID`
+- `MINT_BATON_REQUIRED`
 - `METHOD_NOT_ALLOWED`
 - `NOT_FOUND`
 - `INTERNAL_ERROR`
@@ -86,8 +94,12 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 | `GET /api/tokens/:tokenId/reviews` | Paginated paid reviews |
 | `GET /api/tokens/:tokenId/reviews/summary` | Paid review score summary |
 | `POST /api/tokens/:tokenId/reviews/invoices` | Create a paid review invoice |
+| `GET /api/tokens/:tokenId/project-info` | Current token project info |
+| `POST /api/tokens/:tokenId/project-info/invoices` | Create a paid project info invoice |
 | `GET /api/review-invoices/:invoiceId` | Review invoice detail |
 | `POST /api/review-invoices/:invoiceId/submit-tx` | Submit payment txid for verification |
+| `GET /api/project-info-invoices/:invoiceId` | Project info invoice detail |
+| `POST /api/project-info-invoices/:invoiceId/submit-tx` | Submit project info payment txid for verification |
 | `GET /api/trades` | Global trade history |
 | `GET /api/analytics/summary` | Site-wide access summary |
 | `GET /api/analytics/endpoints` | Access summary by endpoint |
@@ -436,6 +448,56 @@ curl -X POST "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/invoices" \
   -d '{"authorAddress":"ecash:...","score":8,"comment":"optional"}'
 ```
 
+## Project info
+
+Each token can publish one current project info record with `description`, `websiteUrl`, `xUrl`, and `telegramUrl`. Only the address that currently holds the token's mint baton may create a paid invoice to change it.
+
+Fee schedule:
+
+- initial publish: `1,000,000 XEC`
+- later updates: `100,000 XEC`
+
+### `GET /api/tokens/:tokenId/project-info`
+
+Returns the current published project info, or `null` if none exists yet.
+
+### `POST /api/tokens/:tokenId/project-info/invoices`
+
+Creates a pending invoice for publishing or updating project info. The `editorAddress` must currently hold the token mint baton.
+
+Request body:
+
+- `editorAddress`: eCash address
+- `description`: optional string, trimmed and capped at 1000 UTF-8 bytes
+- `websiteUrl`: optional HTTP(S) URL
+- `xUrl`: optional `https://x.com/...` or `https://twitter.com/...` URL
+- `telegramUrl`: optional `https://t.me/...` or `https://telegram.me/...` URL
+
+Response `data`:
+
+- `invoiceId`
+- `tokenId`
+- `editorAddress`
+- `description`
+- `websiteUrl`
+- `xUrl`
+- `telegramUrl`
+- `paymentAddress`
+- `expectedPaidSats`
+- `expectedPaidXec`
+- `feeTier`
+- `status`
+- `expiresAt`
+- `paymentTxid`
+
+### `GET /api/project-info-invoices/:invoiceId`
+
+Returns one project info invoice.
+
+### `POST /api/project-info-invoices/:invoiceId/submit-tx`
+
+Submits a payment transaction id for verification. The transaction must spend at least one input from `editorAddress` and pay exactly `expectedPaidSats` to `paymentAddress`. If Chronik has not indexed the tx yet, the invoice remains `tx_submitted` and the background retry loop can publish it later.
+
 ### `GET /api/review-invoices/:invoiceId`
 
 Returns one invoice using the same response shape as invoice creation.
@@ -506,8 +568,12 @@ Supported analytics `routeKey` values:
 - `tokens.reviews.list`
 - `tokens.reviews.summary`
 - `tokens.review-invoices.create`
+- `tokens.project-info.detail`
+- `tokens.project-info-invoices.create`
 - `review-invoices.detail`
 - `review-invoices.submit-tx`
+- `project-info-invoices.detail`
+- `project-info-invoices.submit-tx`
 - `trades.list`
 
 The default analytics query window is `168` hours. The default retention window is `2160` hours, or 90 days. The maximum query window is capped by the deployment's `ANALYTICS_HOURLY_RETENTION_HOURS`.

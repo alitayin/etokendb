@@ -38,11 +38,18 @@ export function toApiDataService(service: AgoraTokenService): ApiDataService {
     listTokenReviews: (tokenId, query) =>
       service.listTokenReviews(tokenId, query),
     getTokenReviewSummary: (tokenId) => service.getTokenReviewSummary(tokenId),
+    getTokenProjectInfo: (tokenId) => service.getTokenProjectInfo(tokenId),
     createReviewInvoice: (tokenId, input) =>
       service.createReviewInvoice(tokenId, input),
     getReviewInvoice: (invoiceId) => service.getReviewInvoice(invoiceId),
     submitReviewInvoiceTx: (invoiceId, input) =>
       service.submitReviewInvoiceTx(invoiceId, input),
+    createProjectInfoInvoice: (tokenId, input) =>
+      service.createProjectInfoInvoice(tokenId, input),
+    getProjectInfoInvoice: (invoiceId) =>
+      service.getProjectInfoInvoice(invoiceId),
+    submitProjectInfoInvoiceTx: (invoiceId, input) =>
+      service.submitProjectInfoInvoiceTx(invoiceId, input),
   };
 }
 

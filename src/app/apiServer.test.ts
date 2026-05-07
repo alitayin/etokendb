@@ -13,6 +13,7 @@ import type {
   AnalyticsSummary,
   EndpointAnalyticsDetail,
   EndpointAnalyticsSummary,
+  ProjectInfoInvoice,
   TokenCandle,
   TokenCandlesResult,
   TokenCandleQuery,
@@ -21,6 +22,7 @@ import type {
   ServiceStatus,
   TokenDetail,
   TokenListQuery,
+  TokenProjectInfo,
   TokenSummary,
   TokenVisitListQuery,
   TokenVisitAnalytics,
@@ -287,6 +289,41 @@ function sampleReviewInvoice(status: ReviewInvoice["status"] = "pending"): Revie
   };
 }
 
+function sampleTokenProjectInfo(tokenId = "a".repeat(64)): TokenProjectInfo {
+  return {
+    tokenId,
+    description: "Project description",
+    websiteUrl: "https://example.com/",
+    xUrl: "https://x.com/project",
+    telegramUrl: "https://t.me/project",
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    updateCount: 1,
+    lastEditorMasked: "ecash:q...kuu2",
+  };
+}
+
+function sampleProjectInfoInvoice(
+  status: ProjectInfoInvoice["status"] = "pending",
+): ProjectInfoInvoice {
+  return {
+    invoiceId: "project-info-invoice-1",
+    tokenId: "a".repeat(64),
+    editorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+    description: "Project description",
+    websiteUrl: "https://example.com/",
+    xUrl: "https://x.com/project",
+    telegramUrl: "https://t.me/project",
+    paymentAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+    expectedPaidSats: 100_000_000,
+    expectedPaidXec: "1000000.00",
+    feeTier: "initial",
+    status,
+    expiresAt: 1_000_000,
+    paymentTxid: null,
+  };
+}
+
 function makeBaseService(): ApiDataService {
   return {
     isHealthy: () => true,
@@ -364,9 +401,14 @@ function makeBaseService(): ApiDataService {
       commentCountTotal: 0,
       lastReviewAt: null,
     }),
+    getTokenProjectInfo: () => null,
     createReviewInvoice: () => sampleReviewInvoice(),
     getReviewInvoice: () => null,
     submitReviewInvoiceTx: async () => sampleReviewInvoice("tx_submitted"),
+    createProjectInfoInvoice: async () => sampleProjectInfoInvoice(),
+    getProjectInfoInvoice: () => null,
+    submitProjectInfoInvoiceTx: async () =>
+      sampleProjectInfoInvoice("tx_submitted"),
   };
 }
 
@@ -771,6 +813,97 @@ test("review endpoints expose summaries, lists, invoices, and tx submission", as
   assert.equal(wrongMethod.statusCode, 405);
 });
 
+test("project info endpoints expose current info, invoices, and tx submission", async () => {
+  const tokenId = "a".repeat(64);
+  const txid = "c".repeat(64);
+  const projectInfo = sampleTokenProjectInfo(tokenId);
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    getTokenProjectInfo: (receivedTokenId) => {
+      assert.equal(receivedTokenId, tokenId);
+      return projectInfo;
+    },
+    createProjectInfoInvoice: async (receivedTokenId, input) => {
+      assert.equal(receivedTokenId, tokenId);
+      assert.deepEqual(input, {
+        editorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+        description: "Project description",
+        websiteUrl: "https://example.com",
+        xUrl: "https://x.com/project",
+        telegramUrl: "https://t.me/project",
+      });
+      return sampleProjectInfoInvoice();
+    },
+    getProjectInfoInvoice: (invoiceId) =>
+      invoiceId === "project-info-invoice-1"
+        ? sampleProjectInfoInvoice("published")
+        : null,
+    submitProjectInfoInvoiceTx: async (invoiceId, input) => {
+      assert.equal(invoiceId, "project-info-invoice-1");
+      assert.deepEqual(input, { txid });
+      return sampleProjectInfoInvoice("tx_submitted");
+    },
+  };
+
+  const info = await invoke(
+    service,
+    "GET",
+    `/api/tokens/${tokenId}/project-info`,
+  );
+  assert.equal(info.statusCode, 200);
+  assert.deepEqual((info.bodyJson as { data: unknown }).data, projectInfo);
+
+  const created = await invoke(
+    service,
+    "POST",
+    `/api/tokens/${tokenId}/project-info/invoices`,
+    {},
+    {
+      editorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      description: "Project description",
+      websiteUrl: "https://example.com",
+      xUrl: "https://x.com/project",
+      telegramUrl: "https://t.me/project",
+    },
+  );
+  assert.equal(created.statusCode, 201);
+  assert.deepEqual(
+    (created.bodyJson as { data: unknown }).data,
+    sampleProjectInfoInvoice(),
+  );
+
+  const detail = await invoke(
+    service,
+    "GET",
+    "/api/project-info-invoices/project-info-invoice-1",
+  );
+  assert.equal(detail.statusCode, 200);
+  assert.equal(
+    ((detail.bodyJson as { data: ProjectInfoInvoice }).data).status,
+    "published",
+  );
+
+  const submitted = await invoke(
+    service,
+    "POST",
+    "/api/project-info-invoices/project-info-invoice-1/submit-tx",
+    {},
+    { txid },
+  );
+  assert.equal(submitted.statusCode, 200);
+  assert.equal(
+    ((submitted.bodyJson as { data: ProjectInfoInvoice }).data).status,
+    "tx_submitted",
+  );
+
+  const wrongMethod = await invoke(
+    service,
+    "GET",
+    `/api/tokens/${tokenId}/project-info/invoices`,
+  );
+  assert.equal(wrongMethod.statusCode, 405);
+});
+
 test("global trades endpoint is optional", async () => {
   const disabled = await invoke(makeBaseService(), "GET", "/api/trades");
   assert.equal(disabled.statusCode, 404);
@@ -864,6 +997,23 @@ test("analytics recorder tracks matched business routes only after final status 
     options,
     { txid: "b".repeat(64) },
   );
+  await invoke(
+    service,
+    "POST",
+    `/api/tokens/${reviewTokenId}/project-info/invoices`,
+    options,
+    {
+      editorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      description: "Project description",
+    },
+  );
+  await invoke(
+    service,
+    "POST",
+    "/api/project-info-invoices/project-info-invoice-1/submit-tx",
+    options,
+    { txid: "c".repeat(64) },
+  );
   await invoke(service, "GET", "/api/tokens/token-missing", options);
   await invoke(service, "GET", "/api/unknown", options);
   await invoke(service, "GET", "/api/analytics/summary", options);
@@ -901,6 +1051,18 @@ test("analytics recorder tracks matched business routes only after final status 
     },
     {
       routeKey: "review-invoices.submit-tx",
+      statusCode: 200,
+      tokenId: undefined,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "tokens.project-info-invoices.create",
+      statusCode: 201,
+      tokenId: reviewTokenId,
+      countTokenVisit: false,
+    },
+    {
+      routeKey: "project-info-invoices.submit-tx",
       statusCode: 200,
       tokenId: undefined,
       countTokenVisit: false,

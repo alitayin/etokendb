@@ -221,6 +221,10 @@ export type ReviewInvoiceStatus =
   | "invalid"
   | "expired";
 
+export type ProjectInfoInvoiceStatus = ReviewInvoiceStatus;
+
+export type ProjectInfoFeeTier = "initial" | "update";
+
 export interface CreateReviewInvoiceInput {
   authorAddress: string;
   score: number;
@@ -228,6 +232,21 @@ export interface CreateReviewInvoiceInput {
 }
 
 export interface SubmitReviewInvoiceTxInput {
+  txid: string;
+}
+
+export interface ProjectInfoPayload {
+  description?: string;
+  websiteUrl?: string | null;
+  xUrl?: string | null;
+  telegramUrl?: string | null;
+}
+
+export interface CreateProjectInfoInvoiceInput extends ProjectInfoPayload {
+  editorAddress: string;
+}
+
+export interface SubmitProjectInfoInvoiceTxInput {
   txid: string;
 }
 
@@ -244,6 +263,35 @@ export interface ReviewInvoice {
   expiresAt: number;
   paymentTxid: string | null;
   publishedReviewId: string | null;
+}
+
+export interface TokenProjectInfo {
+  tokenId: string;
+  description: string;
+  websiteUrl: string | null;
+  xUrl: string | null;
+  telegramUrl: string | null;
+  createdAt: number;
+  updatedAt: number;
+  updateCount: number;
+  lastEditorMasked: string;
+}
+
+export interface ProjectInfoInvoice {
+  invoiceId: string;
+  tokenId: string;
+  editorAddress: string;
+  description: string;
+  websiteUrl: string | null;
+  xUrl: string | null;
+  telegramUrl: string | null;
+  paymentAddress: string;
+  expectedPaidSats: number;
+  expectedPaidXec: string;
+  feeTier: ProjectInfoFeeTier;
+  status: ProjectInfoInvoiceStatus;
+  expiresAt: number;
+  paymentTxid: string | null;
 }
 
 export interface TokenReviewItem {
@@ -290,6 +338,7 @@ export interface ServiceReadApi {
     query: PaginationQuery,
   ): PaginatedResult<TokenReviewItem>;
   getTokenReviewSummary(tokenId: string): TokenReviewSummary;
+  getTokenProjectInfo(tokenId: string): TokenProjectInfo | null;
   createReviewInvoice(
     tokenId: string,
     input: CreateReviewInvoiceInput,
@@ -299,4 +348,13 @@ export interface ServiceReadApi {
     invoiceId: string,
     input: SubmitReviewInvoiceTxInput,
   ): Promise<ReviewInvoice>;
+  createProjectInfoInvoice(
+    tokenId: string,
+    input: CreateProjectInfoInvoiceInput,
+  ): Promise<ProjectInfoInvoice>;
+  getProjectInfoInvoice(invoiceId: string): ProjectInfoInvoice | null;
+  submitProjectInfoInvoiceTx(
+    invoiceId: string,
+    input: SubmitProjectInfoInvoiceTxInput,
+  ): Promise<ProjectInfoInvoice>;
 }

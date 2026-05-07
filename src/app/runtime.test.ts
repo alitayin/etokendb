@@ -30,6 +30,7 @@ const BASE_CONFIG: AppConfig = {
   reviewBaseFeeSats: 10_000_000,
   reviewInvoiceTtlMs: 30 * 60 * 1000,
   reviewRetryIntervalMs: 60 * 1000,
+  projectInfoPaymentAddress: null,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
@@ -129,6 +130,21 @@ function makeService() {
       lastVisitedAt: null,
       buckets: [],
     }),
+    getTokenProjectInfo: () => null,
+    createReviewInvoice: () => {
+      throw new Error("unused");
+    },
+    getReviewInvoice: () => null,
+    submitReviewInvoiceTx: async () => {
+      throw new Error("unused");
+    },
+    createProjectInfoInvoice: async () => {
+      throw new Error("unused");
+    },
+    getProjectInfoInvoice: () => null,
+    submitProjectInfoInvoiceTx: async () => {
+      throw new Error("unused");
+    },
     recordApiAccess: () => {},
   };
 }

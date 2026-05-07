@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: etokendb API
   version: 0.1.0
-  summary: Public API for token metrics, trade history, paid reviews, candles, and server-side access analytics
+  summary: Public API for token metrics, trade history, paid reviews, project info, candles, and server-side access analytics
   description: |
     etokendb exposes a JSON API backed by SQLite.
 
@@ -13,7 +13,7 @@ info:
 
     General rules:
 
-    - Endpoints are GET only except the documented review invoice POST routes
+    - Endpoints are GET only except the documented paid invoice POST routes
     - Unsupported methods return `405 METHOD_NOT_ALLOWED`
     - Counts are numbers
     - Large satoshi and price values are strings to preserve precision
@@ -29,6 +29,7 @@ tags:
   - name: Status
   - name: Tokens
   - name: Reviews
+  - name: ProjectInfo
   - name: Trades
   - name: Analytics
 paths:
@@ -242,6 +243,49 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/project-info:
+    get:
+      tags: [Tokens, ProjectInfo]
+      summary: Get token project info
+      operationId: getTokenProjectInfo
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+      responses:
+        "200":
+          description: Current project info, or null if none has been published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenProjectInfoResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/tokens/{tokenId}/project-info/invoices:
+    post:
+      tags: [Tokens, ProjectInfo]
+      summary: Create a paid project info invoice
+      operationId: createProjectInfoInvoice
+      description: Requires `editorAddress` to currently hold the token mint baton.
+      parameters:
+        - $ref: "#/components/parameters/TokenIdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectInfoInvoiceRequest"
+      responses:
+        "201":
+          description: Project info invoice created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectInfoInvoiceResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
   /api/review-invoices/{invoiceId}:
     get:
       tags: [Reviews]
@@ -279,6 +323,53 @@ paths:
               schema:
                 $ref: "#/components/schemas/ReviewInvoiceResponse"
         "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "410":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/project-info-invoices/{invoiceId}:
+    get:
+      tags: [ProjectInfo]
+      summary: Get one project info invoice
+      operationId: getProjectInfoInvoice
+      parameters:
+        - $ref: "#/components/parameters/InvoiceIdPathParam"
+      responses:
+        "200":
+          description: Project info invoice detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectInfoInvoiceResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /api/project-info-invoices/{invoiceId}/submit-tx:
+    post:
+      tags: [ProjectInfo]
+      summary: Submit a project info payment transaction id
+      operationId: submitProjectInfoInvoiceTx
+      description: The payment transaction must spend from `editorAddress` and pay exactly `expectedPaidSats` to `paymentAddress`.
+      parameters:
+        - $ref: "#/components/parameters/InvoiceIdPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitReviewInvoiceTxRequest"
+      responses:
+        "200":
+          description: Updated project info invoice
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectInfoInvoiceResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
           $ref: "#/components/responses/ErrorResponse"
         "404":
           $ref: "#/components/responses/ErrorResponse"
@@ -514,8 +605,12 @@ components:
         - tokens.reviews.list
         - tokens.reviews.summary
         - tokens.review-invoices.create
+        - tokens.project-info.detail
+        - tokens.project-info-invoices.create
         - review-invoices.detail
         - review-invoices.submit-tx
+        - project-info-invoices.detail
+        - project-info-invoices.submit-tx
         - trades.list
     ErrorBody:
       type: object
@@ -914,6 +1009,11 @@ components:
         - published
         - invalid
         - expired
+    ProjectInfoFeeTier:
+      type: string
+      enum:
+        - initial
+        - update
     CreateReviewInvoiceRequest:
       type: object
       required: [authorAddress, score]
@@ -935,6 +1035,31 @@ components:
         txid:
           type: string
           pattern: "^[0-9a-fA-F]{64}$"
+    CreateProjectInfoInvoiceRequest:
+      type: object
+      required: [editorAddress]
+      properties:
+        editorAddress:
+          type: string
+        description:
+          type: string
+          maxLength: 1000
+          description: Maximum 1000 UTF-8 bytes after trimming.
+        websiteUrl:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: Optional http:// or https:// URL.
+        xUrl:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: Optional https://x.com/... or https://twitter.com/... URL.
+        telegramUrl:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: Optional https://t.me/... or https://telegram.me/... URL.
     ReviewInvoice:
       type: object
       required:
@@ -989,6 +1114,112 @@ components:
           enum: [true]
         data:
           $ref: "#/components/schemas/ReviewInvoice"
+    TokenProjectInfo:
+      type: object
+      required:
+        - tokenId
+        - description
+        - websiteUrl
+        - xUrl
+        - telegramUrl
+        - createdAt
+        - updatedAt
+        - updateCount
+        - lastEditorMasked
+      properties:
+        tokenId:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+        description:
+          type: string
+        websiteUrl:
+          type: string
+          nullable: true
+        xUrl:
+          type: string
+          nullable: true
+        telegramUrl:
+          type: string
+          nullable: true
+        createdAt:
+          type: integer
+        updatedAt:
+          type: integer
+        updateCount:
+          type: integer
+        lastEditorMasked:
+          type: string
+    TokenProjectInfoResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          anyOf:
+            - $ref: "#/components/schemas/TokenProjectInfo"
+            - type: "null"
+    ProjectInfoInvoice:
+      type: object
+      required:
+        - invoiceId
+        - tokenId
+        - editorAddress
+        - description
+        - websiteUrl
+        - xUrl
+        - telegramUrl
+        - paymentAddress
+        - expectedPaidSats
+        - expectedPaidXec
+        - feeTier
+        - status
+        - expiresAt
+        - paymentTxid
+      properties:
+        invoiceId:
+          type: string
+        tokenId:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+        editorAddress:
+          type: string
+        description:
+          type: string
+        websiteUrl:
+          type: string
+          nullable: true
+        xUrl:
+          type: string
+          nullable: true
+        telegramUrl:
+          type: string
+          nullable: true
+        paymentAddress:
+          type: string
+        expectedPaidSats:
+          type: integer
+        expectedPaidXec:
+          type: string
+        feeTier:
+          $ref: "#/components/schemas/ProjectInfoFeeTier"
+        status:
+          $ref: "#/components/schemas/ReviewInvoiceStatus"
+        expiresAt:
+          type: integer
+        paymentTxid:
+          type: string
+          nullable: true
+    ProjectInfoInvoiceResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        data:
+          $ref: "#/components/schemas/ProjectInfoInvoice"
     TokenReviewItem:
       type: object
       required: [reviewId, tokenId, authorMasked, score, comment, createdAt]

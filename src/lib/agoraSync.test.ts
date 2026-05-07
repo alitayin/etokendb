@@ -29,6 +29,7 @@ const BASE_CONFIG: AppConfig = {
   reviewBaseFeeSats: 10_000_000,
   reviewInvoiceTtlMs: 30 * 60 * 1000,
   reviewRetryIntervalMs: 60 * 1000,
+  projectInfoPaymentAddress: null,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,

@@ -22,6 +22,13 @@ import type {
   TokenReviewRecord,
   TokenReviewSummaryRecord,
 } from "./reviews.js";
+import type {
+  CreateProjectInfoInvoiceRecord,
+  ProjectInfoInvoiceRecord,
+  ProjectInfoInvoiceStatus,
+  PublishTokenProjectInfoRecord,
+  TokenProjectInfoRecord,
+} from "./projectInfo.js";
 import { computeRollingStatsSnapshot } from "./stats.js";
 import type {
   ActiveTokenSeed,
@@ -193,6 +200,35 @@ export interface AppDatabase {
     tokenId: string,
     nowMs?: number,
   ) => DbTokenVisitSnapshot;
+  getTokenProjectInfo: (tokenId: string) => TokenProjectInfoRecord | null;
+  createProjectInfoInvoice: (
+    invoice: CreateProjectInfoInvoiceRecord,
+  ) => ProjectInfoInvoiceRecord;
+  getProjectInfoInvoice: (invoiceId: string) => ProjectInfoInvoiceRecord | null;
+  getProjectInfoInvoiceByPaymentTxid: (
+    txid: string,
+  ) => ProjectInfoInvoiceRecord | null;
+  markProjectInfoInvoiceTxSubmitted: (
+    invoiceId: string,
+    txid: string,
+    updatedAt: number,
+  ) => ProjectInfoInvoiceRecord | null;
+  markProjectInfoInvoiceInvalid: (
+    invoiceId: string,
+    updatedAt: number,
+  ) => ProjectInfoInvoiceRecord | null;
+  expireProjectInfoInvoices: (nowMs?: number) => number;
+  listSubmittedProjectInfoInvoices: (
+    nowMs: number,
+    limit: number,
+  ) => ProjectInfoInvoiceRecord[];
+  publishTokenProjectInfo: (
+    info: PublishTokenProjectInfoRecord,
+    updatedAt: number,
+  ) => {
+    invoice: ProjectInfoInvoiceRecord;
+    projectInfo: TokenProjectInfoRecord;
+  };
   createReviewInvoice: (
     invoice: CreateReviewInvoiceRecord,
   ) => ReviewInvoiceRecord;
@@ -449,6 +485,51 @@ function createSchema(sqlite: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_token_reviews_token_author_created
       ON token_reviews (token_id, author_address, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS token_project_info (
+      token_id TEXT PRIMARY KEY,
+      description TEXT NOT NULL DEFAULT '',
+      website_url TEXT,
+      x_url TEXT,
+      telegram_url TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      update_count INTEGER NOT NULL DEFAULT 1,
+      last_editor_address TEXT NOT NULL,
+      last_payment_txid TEXT NOT NULL UNIQUE,
+      last_paid_sats INTEGER NOT NULL,
+      last_payment_seen_at INTEGER NOT NULL,
+      last_payment_block_height INTEGER,
+      last_payment_block_timestamp INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS project_info_invoices (
+      invoice_id TEXT PRIMARY KEY,
+      token_id TEXT NOT NULL,
+      editor_address TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      website_url TEXT,
+      x_url TEXT,
+      telegram_url TEXT,
+      payment_address TEXT NOT NULL,
+      expected_paid_sats INTEGER NOT NULL,
+      fee_tier TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      payment_txid TEXT,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_project_info_invoices_token_created
+      ON project_info_invoices (token_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_project_info_invoices_status_expires
+      ON project_info_invoices (status, expires_at);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_project_info_invoices_payment_txid
+      ON project_info_invoices (payment_txid)
+      WHERE payment_txid IS NOT NULL;
   `);
 
   ensureColumn(sqlite, "tracked_tokens", "is_ready", "INTEGER NOT NULL DEFAULT 0");
@@ -759,6 +840,49 @@ function toTokenReviewRecord(row: Record<string, unknown>): TokenReviewRecord {
     paymentBlockHeight: toNullableNumber(row.payment_block_height),
     paymentBlockTimestamp: toNullableNumber(row.payment_block_timestamp),
     createdAt: Number(row.created_at),
+  };
+}
+
+function toTokenProjectInfoRecord(
+  row: Record<string, unknown>,
+): TokenProjectInfoRecord {
+  return {
+    tokenId: row.token_id as string,
+    description: String(row.description ?? ""),
+    websiteUrl: (row.website_url as string | null) ?? null,
+    xUrl: (row.x_url as string | null) ?? null,
+    telegramUrl: (row.telegram_url as string | null) ?? null,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    updateCount: Number(row.update_count),
+    lastEditorAddress: row.last_editor_address as string,
+    lastPaymentTxid: row.last_payment_txid as string,
+    lastPaidSats: Number(row.last_paid_sats),
+    lastPaymentSeenAt: Number(row.last_payment_seen_at),
+    lastPaymentBlockHeight: toNullableNumber(row.last_payment_block_height),
+    lastPaymentBlockTimestamp: toNullableNumber(row.last_payment_block_timestamp),
+  };
+}
+
+function toProjectInfoInvoiceRecord(
+  row: Record<string, unknown>,
+): ProjectInfoInvoiceRecord {
+  return {
+    invoiceId: row.invoice_id as string,
+    tokenId: row.token_id as string,
+    editorAddress: row.editor_address as string,
+    description: String(row.description ?? ""),
+    websiteUrl: (row.website_url as string | null) ?? null,
+    xUrl: (row.x_url as string | null) ?? null,
+    telegramUrl: (row.telegram_url as string | null) ?? null,
+    paymentAddress: row.payment_address as string,
+    expectedPaidSats: Number(row.expected_paid_sats),
+    feeTier: row.fee_tier as "initial" | "update",
+    status: row.status as ProjectInfoInvoiceStatus,
+    paymentTxid: (row.payment_txid as string | null) ?? null,
+    expiresAt: Number(row.expires_at),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
   };
 }
 
@@ -1968,6 +2092,210 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     WHERE row_rank = 1
   `);
 
+  const getTokenProjectInfoStmt = sqlite.prepare(`
+    SELECT
+      token_id,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      created_at,
+      updated_at,
+      update_count,
+      last_editor_address,
+      last_payment_txid,
+      last_paid_sats,
+      last_payment_seen_at,
+      last_payment_block_height,
+      last_payment_block_timestamp
+    FROM token_project_info
+    WHERE token_id = ?
+  `);
+
+  const insertProjectInfoInvoiceStmt = sqlite.prepare(`
+    INSERT INTO project_info_invoices (
+      invoice_id,
+      token_id,
+      editor_address,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      payment_address,
+      expected_paid_sats,
+      fee_tier,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at
+    ) VALUES (
+      @invoiceId,
+      @tokenId,
+      @editorAddress,
+      @description,
+      @websiteUrl,
+      @xUrl,
+      @telegramUrl,
+      @paymentAddress,
+      @expectedPaidSats,
+      @feeTier,
+      'pending',
+      NULL,
+      @expiresAt,
+      @createdAt,
+      @createdAt
+    )
+  `);
+
+  const getProjectInfoInvoiceStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      editor_address,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      payment_address,
+      expected_paid_sats,
+      fee_tier,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at
+    FROM project_info_invoices
+    WHERE invoice_id = ?
+  `);
+
+  const getProjectInfoInvoiceByPaymentTxidStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      editor_address,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      payment_address,
+      expected_paid_sats,
+      fee_tier,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at
+    FROM project_info_invoices
+    WHERE payment_txid = ?
+  `);
+
+  const markProjectInfoInvoiceTxSubmittedStmt = sqlite.prepare(`
+    UPDATE project_info_invoices
+    SET
+      status = 'tx_submitted',
+      payment_txid = ?,
+      updated_at = ?
+    WHERE invoice_id = ?
+  `);
+
+  const markProjectInfoInvoiceInvalidStmt = sqlite.prepare(`
+    UPDATE project_info_invoices
+    SET
+      status = 'invalid',
+      updated_at = ?
+    WHERE invoice_id = ?
+  `);
+
+  const expireProjectInfoInvoicesStmt = sqlite.prepare(`
+    UPDATE project_info_invoices
+    SET
+      status = 'expired',
+      updated_at = ?
+    WHERE status IN ('pending', 'tx_submitted')
+      AND expires_at <= ?
+  `);
+
+  const listSubmittedProjectInfoInvoicesStmt = sqlite.prepare(`
+    SELECT
+      invoice_id,
+      token_id,
+      editor_address,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      payment_address,
+      expected_paid_sats,
+      fee_tier,
+      status,
+      payment_txid,
+      expires_at,
+      created_at,
+      updated_at
+    FROM project_info_invoices
+    WHERE status = 'tx_submitted'
+      AND payment_txid IS NOT NULL
+      AND expires_at > ?
+    ORDER BY updated_at ASC, created_at ASC
+    LIMIT ?
+  `);
+
+  const upsertTokenProjectInfoStmt = sqlite.prepare(`
+    INSERT INTO token_project_info (
+      token_id,
+      description,
+      website_url,
+      x_url,
+      telegram_url,
+      created_at,
+      updated_at,
+      update_count,
+      last_editor_address,
+      last_payment_txid,
+      last_paid_sats,
+      last_payment_seen_at,
+      last_payment_block_height,
+      last_payment_block_timestamp
+    ) VALUES (
+      @tokenId,
+      @description,
+      @websiteUrl,
+      @xUrl,
+      @telegramUrl,
+      @updatedAt,
+      @updatedAt,
+      1,
+      @editorAddress,
+      @paymentTxid,
+      @paidSats,
+      @paymentSeenAt,
+      @paymentBlockHeight,
+      @paymentBlockTimestamp
+    )
+    ON CONFLICT(token_id) DO UPDATE SET
+      description = excluded.description,
+      website_url = excluded.website_url,
+      x_url = excluded.x_url,
+      telegram_url = excluded.telegram_url,
+      updated_at = excluded.updated_at,
+      update_count = token_project_info.update_count + 1,
+      last_editor_address = excluded.last_editor_address,
+      last_payment_txid = excluded.last_payment_txid,
+      last_paid_sats = excluded.last_paid_sats,
+      last_payment_seen_at = excluded.last_payment_seen_at,
+      last_payment_block_height = excluded.last_payment_block_height,
+      last_payment_block_timestamp = excluded.last_payment_block_timestamp
+  `);
+
+  const markProjectInfoInvoicePublishedStmt = sqlite.prepare(`
+    UPDATE project_info_invoices
+    SET
+      status = 'published',
+      updated_at = ?
+    WHERE invoice_id = ?
+  `);
+
   const recordApiAccessTx = sqlite.transaction((entry: ApiAccessRecord) => {
     const occurredAtMs = entry.occurredAtMs ?? Date.now();
     const bucketStart = startOfHourMs(occurredAtMs);
@@ -2075,6 +2403,31 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       return {
         invoice: toReviewInvoiceRecord(invoiceRow),
         review: toTokenReviewRecord(reviewRow),
+      };
+    },
+  );
+
+  const publishTokenProjectInfoTx = sqlite.transaction(
+    (info: PublishTokenProjectInfoRecord, updatedAt: number) => {
+      upsertTokenProjectInfoStmt.run(info);
+      markProjectInfoInvoicePublishedStmt.run(updatedAt, info.invoiceId);
+
+      const invoiceRow = getProjectInfoInvoiceStmt.get(info.invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      const projectInfoRow = getTokenProjectInfoStmt.get(info.tokenId) as
+        | Record<string, unknown>
+        | undefined;
+
+      if (!invoiceRow || !projectInfoRow) {
+        throw new Error(
+          "published project info transaction did not return updated rows",
+        );
+      }
+
+      return {
+        invoice: toProjectInfoInvoiceRecord(invoiceRow),
+        projectInfo: toTokenProjectInfoRecord(projectInfoRow),
       };
     },
   );
@@ -2580,6 +2933,58 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       readTokenVisitAnalytics(options.tokenId, options.hours, options.nowMs),
     getTokenVisitSnapshot: (tokenId, nowMs) =>
       readTokenVisitSnapshot(tokenId, nowMs),
+    getTokenProjectInfo: (tokenId) => {
+      const row = getTokenProjectInfoStmt.get(tokenId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toTokenProjectInfoRecord(row) : null;
+    },
+    createProjectInfoInvoice: (invoice) => {
+      insertProjectInfoInvoiceStmt.run(invoice);
+      const row = getProjectInfoInvoiceStmt.get(invoice.invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      if (!row) {
+        throw new Error("created project info invoice could not be read back");
+      }
+      return toProjectInfoInvoiceRecord(row);
+    },
+    getProjectInfoInvoice: (invoiceId) => {
+      const row = getProjectInfoInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toProjectInfoInvoiceRecord(row) : null;
+    },
+    getProjectInfoInvoiceByPaymentTxid: (txid) => {
+      const row = getProjectInfoInvoiceByPaymentTxidStmt.get(txid) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toProjectInfoInvoiceRecord(row) : null;
+    },
+    markProjectInfoInvoiceTxSubmitted: (invoiceId, txid, updatedAt) => {
+      markProjectInfoInvoiceTxSubmittedStmt.run(txid, updatedAt, invoiceId);
+      const row = getProjectInfoInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toProjectInfoInvoiceRecord(row) : null;
+    },
+    markProjectInfoInvoiceInvalid: (invoiceId, updatedAt) => {
+      markProjectInfoInvoiceInvalidStmt.run(updatedAt, invoiceId);
+      const row = getProjectInfoInvoiceStmt.get(invoiceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? toProjectInfoInvoiceRecord(row) : null;
+    },
+    expireProjectInfoInvoices: (nowMs = Date.now()) =>
+      expireProjectInfoInvoicesStmt.run(nowMs, nowMs).changes,
+    listSubmittedProjectInfoInvoices: (nowMs, limit) =>
+      (
+        listSubmittedProjectInfoInvoicesStmt.all(nowMs, limit) as Array<
+          Record<string, unknown>
+        >
+      ).map(toProjectInfoInvoiceRecord),
+    publishTokenProjectInfo: (info, updatedAt) =>
+      publishTokenProjectInfoTx(info, updatedAt),
     createReviewInvoice: (invoice) => {
       insertReviewInvoiceStmt.run(invoice);
       const row = getReviewInvoiceStmt.get(invoice.invoiceId) as

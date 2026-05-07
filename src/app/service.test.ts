@@ -59,6 +59,7 @@ const BASE_CONFIG: AppConfig = {
   reviewBaseFeeSats: 10_000_000,
   reviewInvoiceTtlMs: 30 * 60 * 1000,
   reviewRetryIntervalMs: 60 * 1000,
+  projectInfoPaymentAddress: null,
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
@@ -71,6 +72,7 @@ const OTHER_REVIEW_ADDRESS = encodeOutputScript(
   `76a914${"11".repeat(20)}88ac`,
 );
 const REVIEW_TOKEN_ID = "d".repeat(64);
+const PROJECT_TOKEN_ID = "e".repeat(64);
 
 function makeTx(params: {
   txid: string;
@@ -126,15 +128,46 @@ function makeReviewService(options: {
   db?: ReturnType<typeof openDatabase>;
   txs?: Map<string, unknown>;
   nowMs?: () => number;
+  mintBatonAddresses?: Set<string>;
 } = {}) {
   const db = options.db ?? openDatabase(":memory:");
   const txs = options.txs ?? new Map<string, unknown>();
+  const mintBatonAddresses =
+    options.mintBatonAddresses ?? new Set([REVIEW_AUTHOR_ADDRESS]);
   let invoiceCounter = 0;
   let reviewCounter = 0;
+  let projectInfoInvoiceCounter = 0;
   const service = new AgoraTokenService(
     db,
     {
       chronik: {
+        address: (address: string) =>
+          ({
+            utxos: async () => ({
+              outputScript: getOutputScriptFromAddress(address),
+              utxos: mintBatonAddresses.has(address)
+                ? [
+                    {
+                      outpoint: { txid: "mint-baton", outIdx: 1 },
+                      blockHeight: 900_000,
+                      isCoinbase: false,
+                      sats: 546n,
+                      isFinal: true,
+                      token: {
+                        tokenId: PROJECT_TOKEN_ID,
+                        tokenType: {
+                          protocol: "ALP",
+                          type: "ALP_TOKEN_TYPE_STANDARD",
+                          number: 0,
+                        },
+                        atoms: 0n,
+                        isMintBaton: true,
+                      },
+                    },
+                  ]
+                : [],
+            }),
+          }) as never,
         plugin: () => ({}) as never,
         tx: async (txid: string) => {
           const tx = txs.get(txid);
@@ -168,6 +201,7 @@ function makeReviewService(options: {
       reviewPaymentAddress: REVIEW_PAYMENT_ADDRESS,
       reviewBaseFeeSats: 1_000,
       reviewInvoiceTtlMs: 1_000,
+      projectInfoPaymentAddress: REVIEW_PAYMENT_ADDRESS,
     },
     {
       logger: {
@@ -179,6 +213,8 @@ function makeReviewService(options: {
       reviewInvoiceIdFactory: () => `invoice-${++invoiceCounter}`,
       reviewIdFactory: () => `review-${++reviewCounter}`,
       reviewVerifierSatsFactory: () => 23,
+      projectInfoInvoiceIdFactory: () =>
+        `project-info-invoice-${++projectInfoInvoiceCounter}`,
     },
   );
   return { db, service, txs };
@@ -512,6 +548,186 @@ test("review invoice submit rejects expired invoices and duplicate txids", async
       () => service.submitReviewInvoiceTx(second.invoiceId, { txid }),
       (error) =>
         error instanceof ReviewError && error.code === "PAYMENT_TXID_REUSED",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoice creation requires mint baton ownership", async () => {
+  const { db, service } = makeReviewService({
+    mintBatonAddresses: new Set(),
+  });
+
+  try {
+    await assert.rejects(
+      () =>
+        service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+          editorAddress: REVIEW_AUTHOR_ADDRESS,
+          description: "Credo project",
+        }),
+      (error) =>
+        error instanceof ReviewError && error.code === "MINT_BATON_REQUIRED",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoice publish rejects if mint baton is moved before payment verification", async () => {
+  const txid = "9".repeat(64);
+  const mintBatonAddresses = new Set([REVIEW_AUTHOR_ADDRESS]);
+  const { db, service, txs } = makeReviewService({
+    mintBatonAddresses,
+  });
+  txs.set(
+    txid,
+    makeTx({
+      txid,
+      paidSats: 100_000_000n,
+    }),
+  );
+
+  try {
+    const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      description: "Project info",
+    });
+    mintBatonAddresses.clear();
+
+    await assert.rejects(
+      () => service.submitProjectInfoInvoiceTx(invoice.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError && error.code === "MINT_BATON_REQUIRED",
+    );
+    assert.equal(
+      service.getProjectInfoInvoice(invoice.invoiceId)?.status,
+      "invalid",
+    );
+    assert.equal(service.getTokenProjectInfo(PROJECT_TOKEN_ID), null);
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoices use initial fee then update fee", async () => {
+  const firstTxid = "6".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(
+    firstTxid,
+    makeTx({
+      txid: firstTxid,
+      paidSats: 100_000_000n,
+    }),
+  );
+
+  try {
+    const first = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      description: " Credo project ",
+      websiteUrl: "https://example.com",
+      xUrl: "https://x.com/project",
+      telegramUrl: "https://t.me/project",
+    });
+    assert.equal(first.invoiceId, "project-info-invoice-1");
+    assert.equal(first.expectedPaidSats, 100_000_000);
+    assert.equal(first.expectedPaidXec, "1000000.00");
+    assert.equal(first.feeTier, "initial");
+    assert.equal(first.description, "Credo project");
+    assert.equal(first.websiteUrl, "https://example.com/");
+
+    const published = await service.submitProjectInfoInvoiceTx(first.invoiceId, {
+      txid: firstTxid,
+    });
+    assert.equal(published.status, "published");
+
+    const current = service.getTokenProjectInfo(PROJECT_TOKEN_ID);
+    assert.deepEqual(current, {
+      tokenId: PROJECT_TOKEN_ID,
+      description: "Credo project",
+      websiteUrl: "https://example.com/",
+      xUrl: "https://x.com/project",
+      telegramUrl: "https://t.me/project",
+      createdAt: 10_000,
+      updatedAt: 10_000,
+      updateCount: 1,
+      lastEditorMasked: "ecash:q...kuu2",
+    });
+
+    const update = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      description: "",
+    });
+    assert.equal(update.expectedPaidSats, 10_000_000);
+    assert.equal(update.expectedPaidXec, "100000.00");
+    assert.equal(update.feeTier, "update");
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoice submit stores tx_submitted until Chronik indexes tx", async () => {
+  const txid = "7".repeat(64);
+  const { db, service, txs } = makeReviewService();
+
+  try {
+    const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      description: "Project info",
+    });
+    const pending = await service.submitProjectInfoInvoiceTx(invoice.invoiceId, {
+      txid,
+    });
+    assert.equal(pending.status, "tx_submitted");
+
+    txs.set(
+      txid,
+      makeTx({
+        txid,
+        paidSats: 100_000_000n,
+      }),
+    );
+    const retry = await service.retryPendingProjectInfoPayments();
+    assert.deepEqual(retry, {
+      checked: 1,
+      published: 1,
+      invalid: 0,
+      expired: 0,
+    });
+    assert.equal(
+      service.getProjectInfoInvoice(invoice.invoiceId)?.status,
+      "published",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoice submit rejects wrong payment amount and marks invalid", async () => {
+  const txid = "8".repeat(64);
+  const { db, service, txs } = makeReviewService();
+  txs.set(
+    txid,
+    makeTx({
+      txid,
+      paidSats: 100_000_001n,
+    }),
+  );
+
+  try {
+    const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      description: "Project info",
+    });
+    await assert.rejects(
+      () => service.submitProjectInfoInvoiceTx(invoice.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_OUTPUT_MISMATCH",
+    );
+    assert.equal(
+      service.getProjectInfoInvoice(invoice.invoiceId)?.status,
+      "invalid",
     );
   } finally {
     db.close();
