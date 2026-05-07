@@ -73,6 +73,10 @@ const OTHER_REVIEW_ADDRESS = encodeOutputScript(
 );
 const REVIEW_TOKEN_ID = "d".repeat(64);
 const PROJECT_TOKEN_ID = "e".repeat(64);
+const PROJECT_AUTH_PUBKEY =
+  "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const PROJECT_EDITOR_ADDRESS =
+  "ecash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cacy2kzvq";
 
 function makeTx(params: {
   txid: string;
@@ -128,12 +132,16 @@ function makeReviewService(options: {
   db?: ReturnType<typeof openDatabase>;
   txs?: Map<string, unknown>;
   nowMs?: () => number;
-  mintBatonAddresses?: Set<string>;
+  projectAuthPubkey?: string | null | (() => string | null);
 } = {}) {
   const db = options.db ?? openDatabase(":memory:");
   const txs = options.txs ?? new Map<string, unknown>();
-  const mintBatonAddresses =
-    options.mintBatonAddresses ?? new Set([REVIEW_AUTHOR_ADDRESS]);
+  const getProjectAuthPubkey = () =>
+    options.projectAuthPubkey === undefined
+      ? PROJECT_AUTH_PUBKEY
+      : typeof options.projectAuthPubkey === "function"
+        ? options.projectAuthPubkey()
+      : options.projectAuthPubkey;
   let invoiceCounter = 0;
   let reviewCounter = 0;
   let projectInfoInvoiceCounter = 0;
@@ -141,33 +149,28 @@ function makeReviewService(options: {
     db,
     {
       chronik: {
-        address: (address: string) =>
-          ({
-            utxos: async () => ({
-              outputScript: getOutputScriptFromAddress(address),
-              utxos: mintBatonAddresses.has(address)
-                ? [
-                    {
-                      outpoint: { txid: "mint-baton", outIdx: 1 },
-                      blockHeight: 900_000,
-                      isCoinbase: false,
-                      sats: 546n,
-                      isFinal: true,
-                      token: {
-                        tokenId: PROJECT_TOKEN_ID,
-                        tokenType: {
-                          protocol: "ALP",
-                          type: "ALP_TOKEN_TYPE_STANDARD",
-                          number: 0,
-                        },
-                        atoms: 0n,
-                        isMintBaton: true,
-                      },
-                    },
-                  ]
-                : [],
-            }),
-          }) as never,
+        token: async () => {
+          const projectAuthPubkey = getProjectAuthPubkey();
+          return {
+            tokenId: PROJECT_TOKEN_ID,
+            tokenType: {
+              protocol: "ALP",
+              type: "ALP_TOKEN_TYPE_STANDARD",
+              number: 0,
+            },
+            genesisInfo: {
+              tokenTicker: "CRD",
+              tokenName: "Credo In Unum Deo",
+              url: "https://crd.network/token",
+              decimals: 4,
+              data: "",
+              ...(projectAuthPubkey === null
+                ? {}
+                : { authPubkey: projectAuthPubkey }),
+            },
+            timeFirstSeen: 0,
+          } as never;
+        },
         plugin: () => ({}) as never,
         tx: async (txid: string) => {
           const tx = txs.get(txid);
@@ -243,6 +246,7 @@ test("service performs tail catch-up before marking bootstrap token ready", asyn
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () =>
           ({
@@ -554,10 +558,8 @@ test("review invoice submit rejects expired invoices and duplicate txids", async
   }
 });
 
-test("project info invoice creation requires mint baton ownership", async () => {
-  const { db, service } = makeReviewService({
-    mintBatonAddresses: new Set(),
-  });
+test("project info invoice creation requires genesis authPubkey editor", async () => {
+  const { db, service } = makeReviewService();
 
   try {
     await assert.rejects(
@@ -567,38 +569,76 @@ test("project info invoice creation requires mint baton ownership", async () => 
           description: "Credo project",
         }),
       (error) =>
-        error instanceof ReviewError && error.code === "MINT_BATON_REQUIRED",
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
     );
   } finally {
     db.close();
   }
 });
 
-test("project info invoice publish rejects if mint baton is moved before payment verification", async () => {
+test("project info invoice creation rejects missing or invalid genesis authPubkey", async () => {
+  const missing = makeReviewService({ projectAuthPubkey: null });
+  try {
+    await assert.rejects(
+      () =>
+        missing.service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+          editorAddress: PROJECT_EDITOR_ADDRESS,
+          description: "Project info",
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+    );
+  } finally {
+    missing.db.close();
+  }
+
+  const invalid = makeReviewService({ projectAuthPubkey: "abcd" });
+  try {
+    await assert.rejects(
+      () =>
+        invalid.service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+          editorAddress: PROJECT_EDITOR_ADDRESS,
+          description: "Project info",
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+    );
+  } finally {
+    invalid.db.close();
+  }
+});
+
+test("project info invoice publish rejects if genesis authPubkey changes before payment verification", async () => {
   const txid = "9".repeat(64);
-  const mintBatonAddresses = new Set([REVIEW_AUTHOR_ADDRESS]);
+  const authPubkey = { value: PROJECT_AUTH_PUBKEY };
   const { db, service, txs } = makeReviewService({
-    mintBatonAddresses,
+    projectAuthPubkey: () => authPubkey.value,
   });
   txs.set(
     txid,
     makeTx({
       txid,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
       paidSats: 100_000_000n,
     }),
   );
 
   try {
     const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
-      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      editorAddress: PROJECT_EDITOR_ADDRESS,
       description: "Project info",
     });
-    mintBatonAddresses.clear();
+    authPubkey.value =
+      "03f028892bad7ed57d2fb57bf33081d5cfcf6f9ed3d3d7f159c2e2fff579dc341a";
 
     await assert.rejects(
       () => service.submitProjectInfoInvoiceTx(invoice.invoiceId, { txid }),
       (error) =>
-        error instanceof ReviewError && error.code === "MINT_BATON_REQUIRED",
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
     );
     assert.equal(
       service.getProjectInfoInvoice(invoice.invoiceId)?.status,
@@ -617,13 +657,14 @@ test("project info invoices use initial fee then update fee", async () => {
     firstTxid,
     makeTx({
       txid: firstTxid,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
       paidSats: 100_000_000n,
     }),
   );
 
   try {
     const first = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
-      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      editorAddress: PROJECT_EDITOR_ADDRESS,
       description: " Credo project ",
       websiteUrl: "https://example.com",
       xUrl: "https://x.com/project",
@@ -651,11 +692,11 @@ test("project info invoices use initial fee then update fee", async () => {
       createdAt: 10_000,
       updatedAt: 10_000,
       updateCount: 1,
-      lastEditorMasked: "ecash:q...kuu2",
+      lastEditorMasked: "ecash:q...kzvq",
     });
 
     const update = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
-      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      editorAddress: PROJECT_EDITOR_ADDRESS,
       description: "",
     });
     assert.equal(update.expectedPaidSats, 10_000_000);
@@ -672,7 +713,7 @@ test("project info invoice submit stores tx_submitted until Chronik indexes tx",
 
   try {
     const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
-      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      editorAddress: PROJECT_EDITOR_ADDRESS,
       description: "Project info",
     });
     const pending = await service.submitProjectInfoInvoiceTx(invoice.invoiceId, {
@@ -684,6 +725,7 @@ test("project info invoice submit stores tx_submitted until Chronik indexes tx",
       txid,
       makeTx({
         txid,
+        authorAddress: PROJECT_EDITOR_ADDRESS,
         paidSats: 100_000_000n,
       }),
     );
@@ -710,13 +752,14 @@ test("project info invoice submit rejects wrong payment amount and marks invalid
     txid,
     makeTx({
       txid,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
       paidSats: 100_000_001n,
     }),
   );
 
   try {
     const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
-      editorAddress: REVIEW_AUTHOR_ADDRESS,
+      editorAddress: PROJECT_EDITOR_ADDRESS,
       description: "Project info",
     });
     await assert.rejects(
@@ -869,6 +912,7 @@ test("service rejects startup when a bootstrap token fails initialization", asyn
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -933,6 +977,7 @@ test("service performs a polling catch-up before ready when websocket bootstrap 
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1020,6 +1065,7 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1144,6 +1190,7 @@ test("service can defer known low-trade tokens by configurable threshold", async
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1277,6 +1324,7 @@ test("service exposes latest price and rolling stats in token list and detail vi
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1391,6 +1439,7 @@ test("service exposes token visit stats and analytics queries", () => {
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1522,6 +1571,7 @@ test("service returns concrete trade history fields from stored trades", () => {
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>
@@ -1613,6 +1663,7 @@ test("service returns aggregated token candles for charting", () => {
     db,
     {
       chronik: {
+        token: async () => { throw new Error("unused"); },
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: () =>

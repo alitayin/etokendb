@@ -101,6 +101,7 @@ function makeDeps(
 ): SyncDependencies {
   return {
     chronik: {
+      token: async () => { throw new Error("unused"); },
       plugin: () =>
         ({
           groups: async (

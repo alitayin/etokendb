@@ -84,20 +84,6 @@ export interface ProjectInfoPaymentVerification {
   paymentBlockTimestamp: number | null;
 }
 
-export interface ChronikMintBatonUtxosClient {
-  address(address: string): {
-    utxos(): Promise<{
-      utxos: Array<{
-        token?: {
-          tokenId: string;
-          atoms?: bigint;
-          isMintBaton: boolean;
-        };
-      }>;
-    }>;
-  };
-}
-
 function normalizeStringField(value: unknown, fieldName: string): string {
   if (value === undefined || value === null) {
     return "";
@@ -221,21 +207,6 @@ export function normalizeProjectInfoFields(
   }
 
   return fields;
-}
-
-export async function addressOwnsMintBaton(params: {
-  chronik: ChronikMintBatonUtxosClient;
-  address: string;
-  tokenId: string;
-}): Promise<boolean> {
-  const utxos = await params.chronik.address(params.address).utxos();
-  return utxos.utxos.some((utxo) => {
-    const token = utxo.token;
-    return (
-      token?.tokenId.toLowerCase() === params.tokenId &&
-      token.isMintBaton === true
-    );
-  });
 }
 
 export function verifyProjectInfoPaymentTx(params: {

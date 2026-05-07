@@ -264,7 +264,7 @@ paths:
       tags: [Tokens, ProjectInfo]
       summary: Create a paid project info invoice
       operationId: createProjectInfoInvoice
-      description: Requires `editorAddress` to currently hold the token mint baton.
+      description: Requires `editorAddress` to match the eCash p2pkh address derived from the token genesis `authPubkey`.
       parameters:
         - $ref: "#/components/parameters/TokenIdPathParam"
       requestBody:

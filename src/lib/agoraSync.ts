@@ -27,7 +27,10 @@ interface RawOfferSpendContext {
 }
 
 export interface SyncDependencies {
-  chronik: Pick<ChronikClient, "plugin" | "tx" | "ws" | "blockchainInfo">;
+  chronik: Pick<
+    ChronikClient,
+    "plugin" | "tx" | "ws" | "blockchainInfo" | "token"
+  >;
   agora: Pick<
     Agora,
     | "historicOffers"

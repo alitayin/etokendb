@@ -1,7 +1,8 @@
 import fs from "node:fs";
-import { randomInt, randomUUID } from "node:crypto";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 
-import type { ChronikClient, Tx, WsEndpoint, WsMsgClient } from "chronik-client";
+import type { TokenInfo, Tx, WsEndpoint, WsMsgClient } from "chronik-client";
+import { encodeCashAddress } from "ecashaddrjs";
 
 import {
   discoverActiveTokens,
@@ -38,10 +39,8 @@ import {
 import {
   PROJECT_INFO_INITIAL_FEE_SATS,
   PROJECT_INFO_UPDATE_FEE_SATS,
-  addressOwnsMintBaton,
   normalizeProjectInfoFields,
   verifyProjectInfoPaymentTx,
-  type ChronikMintBatonUtxosClient,
   type ProjectInfoInvoiceRecord,
   type TokenProjectInfoRecord,
 } from "../lib/projectInfo.js";
@@ -78,10 +77,6 @@ import type {
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
 const CANDLE_TIMEZONE = "Asia/Shanghai";
-
-type ProjectInfoDependencies = SyncDependencies & {
-  chronik: SyncDependencies["chronik"] & Partial<Pick<ChronikClient, "address">>;
-};
 
 type TokenPhase = "pending" | "initializing" | "catching-up" | "ready" | "error";
 
@@ -476,7 +471,7 @@ export class AgoraTokenService implements ServiceReadApi {
 
   constructor(
     private readonly db: AppDatabase,
-    private readonly deps: ProjectInfoDependencies,
+    private readonly deps: SyncDependencies,
     private readonly config: AppConfig,
     options?: AgoraTokenServiceOptions,
   ) {
@@ -937,7 +932,7 @@ export class AgoraTokenService implements ServiceReadApi {
       allowEmpty: existingInfo !== null,
     });
 
-    await this.requireMintBatonOwner(normalizedTokenId, editorAddress);
+    await this.requireGenesisAuthPubkeyEditor(normalizedTokenId, editorAddress);
 
     const nowMs = this.nowMs();
     const feeTier = existingInfo ? "update" : "initial";
@@ -1105,22 +1100,40 @@ export class AgoraTokenService implements ServiceReadApi {
     }
   }
 
-  private async requireMintBatonOwner(
+  private async requireGenesisAuthPubkeyEditor(
     tokenId: string,
     editorAddress: string,
   ): Promise<void> {
-    const ownsMintBaton = await addressOwnsMintBaton({
-      chronik: this.deps.chronik as ChronikMintBatonUtxosClient,
-      address: editorAddress,
-      tokenId,
-    });
-    if (!ownsMintBaton) {
+    const token = await this.deps.chronik.token(tokenId);
+    const expectedEditorAddress = this.getGenesisAuthPubkeyEditorAddress(token);
+    if (expectedEditorAddress !== editorAddress) {
       throw new ReviewError(
         403,
-        "MINT_BATON_REQUIRED",
-        "editorAddress must currently hold this token's mint baton",
+        "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+        "editorAddress must match the token genesis authPubkey address",
       );
     }
+  }
+
+  private getGenesisAuthPubkeyEditorAddress(
+    token: TokenInfo | undefined,
+  ): string {
+    const authPubkey = token?.genesisInfo?.authPubkey;
+    if (!authPubkey || !/^(02|03)[0-9a-fA-F]{64}$/.test(authPubkey)) {
+      throw new ReviewError(
+        403,
+        "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+        "token genesis authPubkey must be a compressed public key",
+      );
+    }
+
+    const pubkeyBytes = Buffer.from(authPubkey, "hex");
+    const sha256Hash = createHash("sha256").update(pubkeyBytes).digest();
+    const hash160 = createHash("ripemd160").update(sha256Hash).digest();
+    return normalizeEcashAddress(
+      encodeCashAddress("ecash", "p2pkh", hash160),
+      "genesisAuthPubkeyAddress",
+    );
   }
 
   private getOpenReviewInvoice(invoiceId: string): ReviewInvoiceRecord {
@@ -1282,11 +1295,14 @@ export class AgoraTokenService implements ServiceReadApi {
     }
 
     try {
-      await this.requireMintBatonOwner(invoice.tokenId, invoice.editorAddress);
+      await this.requireGenesisAuthPubkeyEditor(
+        invoice.tokenId,
+        invoice.editorAddress,
+      );
     } catch (error) {
       if (
         error instanceof ReviewError &&
-        error.code === "MINT_BATON_REQUIRED"
+        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED"
       ) {
         const invalidInvoice =
           this.db.markProjectInfoInvoiceInvalid(invoice.invoiceId, nowMs) ??

@@ -84,6 +84,7 @@ test("live sync only marks subscribed fungible token ids dirty", async () => {
 
   const deps: SyncDependencies = {
     chronik: {
+      token: async () => { throw new Error("unused"); },
       plugin: () =>
         ({
           groups: async () => ({
