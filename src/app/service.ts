@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { createHash, randomInt, randomUUID } from "node:crypto";
 
 import type { TokenInfo, Tx, WsEndpoint, WsMsgClient } from "chronik-client";
-import { encodeCashAddress } from "ecashaddrjs";
+import { encodeCashAddress, encodeOutputScript } from "ecashaddrjs";
 
 import {
   discoverActiveTokens,
@@ -931,7 +931,7 @@ export class AgoraTokenService implements ServiceReadApi {
       allowEmpty: existingInfo !== null,
     });
 
-    await this.requireGenesisAuthPubkeyEditor(normalizedTokenId, editorAddress);
+    await this.requireProjectInfoEditor(normalizedTokenId, editorAddress);
 
     const nowMs = this.nowMs();
     const feeTier = existingInfo ? "update" : "initial";
@@ -1100,26 +1100,61 @@ export class AgoraTokenService implements ServiceReadApi {
     }
   }
 
-  private async requireGenesisAuthPubkeyEditor(
+  private async requireProjectInfoEditor(
     tokenId: string,
     editorAddress: string,
   ): Promise<void> {
-    const token = await this.deps.chronik.token(tokenId);
-    const expectedEditorAddress = this.getGenesisAuthPubkeyEditorAddress(token);
+    const expectedEditorAddress =
+      await this.resolveProjectInfoEditorAddress(tokenId);
     if (expectedEditorAddress !== editorAddress) {
       throw new ReviewError(
         403,
-        "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
-        "editorAddress must match the token genesis authPubkey address",
+        "PROJECT_INFO_CREATOR_REQUIRED",
+        "editorAddress must match the token creator address",
       );
     }
   }
 
+  private async resolveProjectInfoEditorAddress(tokenId: string): Promise<string> {
+    const token = await this.deps.chronik.token(tokenId);
+    const authPubkeyEditorAddress =
+      this.getGenesisAuthPubkeyEditorAddress(token);
+    if (authPubkeyEditorAddress) {
+      return authPubkeyEditorAddress;
+    }
+
+    let genesisTx: Tx;
+    try {
+      genesisTx = await this.deps.chronik.tx(tokenId);
+    } catch {
+      throw new ReviewError(
+        403,
+        "PROJECT_INFO_CREATOR_REQUIRED",
+        "token creator address could not be resolved",
+      );
+    }
+
+    const genesisInputEditorAddress =
+      this.getGenesisInputEditorAddress(genesisTx);
+    if (genesisInputEditorAddress) {
+      return genesisInputEditorAddress;
+    }
+
+    throw new ReviewError(
+      403,
+      "PROJECT_INFO_CREATOR_REQUIRED",
+      "token creator address could not be resolved",
+    );
+  }
+
   private getGenesisAuthPubkeyEditorAddress(
     token: TokenInfo | undefined,
-  ): string {
+  ): string | null {
     const authPubkey = token?.genesisInfo?.authPubkey;
-    if (!authPubkey || !/^(02|03)[0-9a-fA-F]{64}$/.test(authPubkey)) {
+    if (!authPubkey) {
+      return null;
+    }
+    if (!/^(02|03)[0-9a-fA-F]{64}$/.test(authPubkey)) {
       throw new ReviewError(
         403,
         "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
@@ -1134,6 +1169,26 @@ export class AgoraTokenService implements ServiceReadApi {
       encodeCashAddress("ecash", "p2pkh", hash160),
       "genesisAuthPubkeyAddress",
     );
+  }
+
+  private getGenesisInputEditorAddress(tx: Tx): string | null {
+    for (const input of tx.inputs ?? []) {
+      const outputScript = input.outputScript;
+      if (typeof outputScript !== "string" || outputScript.length === 0) {
+        continue;
+      }
+
+      try {
+        return normalizeEcashAddress(
+          encodeOutputScript(outputScript),
+          "genesisInputAddress",
+        );
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
   }
 
   private getOpenReviewInvoice(invoiceId: string): ReviewInvoiceRecord {
@@ -1295,14 +1350,12 @@ export class AgoraTokenService implements ServiceReadApi {
     }
 
     try {
-      await this.requireGenesisAuthPubkeyEditor(
-        invoice.tokenId,
-        invoice.editorAddress,
-      );
+      await this.requireProjectInfoEditor(invoice.tokenId, invoice.editorAddress);
     } catch (error) {
       if (
         error instanceof ReviewError &&
-        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED"
+        (error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED" ||
+          error.code === "PROJECT_INFO_CREATOR_REQUIRED")
       ) {
         const invalidInvoice =
           this.db.markProjectInfoInvoiceInvalid(invoice.invoiceId, nowMs) ??

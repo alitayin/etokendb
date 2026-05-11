@@ -560,7 +560,7 @@ test("review invoice submit rejects expired invoices and duplicate txids", async
   }
 });
 
-test("project info invoice creation requires genesis authPubkey editor", async () => {
+test("project info invoice creation requires token creator editor", async () => {
   const { db, service } = makeReviewService();
 
   try {
@@ -572,30 +572,80 @@ test("project info invoice creation requires genesis authPubkey editor", async (
         }),
       (error) =>
         error instanceof ReviewError &&
-        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+        error.code === "PROJECT_INFO_CREATOR_REQUIRED",
     );
   } finally {
     db.close();
   }
 });
 
-test("project info invoice creation rejects missing or invalid genesis authPubkey", async () => {
+test("project info invoice creation falls back to genesis input creator without authPubkey", async () => {
   const missing = makeReviewService({ projectAuthPubkey: null });
+  missing.txs.set(
+    PROJECT_TOKEN_ID,
+    makeTx({
+      txid: PROJECT_TOKEN_ID,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
+    }),
+  );
+
+  try {
+    const invoice = await missing.service.createProjectInfoInvoice(
+      PROJECT_TOKEN_ID,
+      {
+        editorAddress: PROJECT_EDITOR_ADDRESS,
+        description: "Project info",
+      },
+    );
+    assert.equal(invoice.status, "pending");
+    assert.equal(invoice.editorAddress, PROJECT_EDITOR_ADDRESS);
+  } finally {
+    missing.db.close();
+  }
+});
+
+test("project info invoice creation rejects unresolved or mismatched genesis creator", async () => {
+  const unresolved = makeReviewService({ projectAuthPubkey: null });
   try {
     await assert.rejects(
       () =>
-        missing.service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+        unresolved.service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
           editorAddress: PROJECT_EDITOR_ADDRESS,
           description: "Project info",
         }),
       (error) =>
         error instanceof ReviewError &&
-        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+        error.code === "PROJECT_INFO_CREATOR_REQUIRED",
     );
   } finally {
-    missing.db.close();
+    unresolved.db.close();
   }
 
+  const mismatched = makeReviewService({ projectAuthPubkey: null });
+  mismatched.txs.set(
+    PROJECT_TOKEN_ID,
+    makeTx({
+      txid: PROJECT_TOKEN_ID,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
+    }),
+  );
+  try {
+    await assert.rejects(
+      () =>
+        mismatched.service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+          editorAddress: REVIEW_AUTHOR_ADDRESS,
+          description: "Project info",
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_CREATOR_REQUIRED",
+    );
+  } finally {
+    mismatched.db.close();
+  }
+});
+
+test("project info invoice creation rejects invalid genesis authPubkey", async () => {
   const invalid = makeReviewService({ projectAuthPubkey: "abcd" });
   try {
     await assert.rejects(
@@ -613,7 +663,7 @@ test("project info invoice creation rejects missing or invalid genesis authPubke
   }
 });
 
-test("project info invoice publish rejects if genesis authPubkey changes before payment verification", async () => {
+test("project info invoice publish rejects if authPubkey creator changes before payment verification", async () => {
   const txid = "9".repeat(64);
   const authPubkey = { value: PROJECT_AUTH_PUBKEY };
   const { db, service, txs } = makeReviewService({
@@ -640,7 +690,57 @@ test("project info invoice publish rejects if genesis authPubkey changes before 
       () => service.submitProjectInfoInvoiceTx(invoice.invoiceId, { txid }),
       (error) =>
         error instanceof ReviewError &&
-        error.code === "PROJECT_INFO_AUTH_PUBKEY_REQUIRED",
+        error.code === "PROJECT_INFO_CREATOR_REQUIRED",
+    );
+    assert.equal(
+      service.getProjectInfoInvoice(invoice.invoiceId)?.status,
+      "invalid",
+    );
+    assert.equal(service.getTokenProjectInfo(PROJECT_TOKEN_ID), null);
+  } finally {
+    db.close();
+  }
+});
+
+test("project info invoice publish rejects if fallback genesis creator changes before payment verification", async () => {
+  const txid = "4".repeat(64);
+  const genesisAuthorAddress = { value: PROJECT_EDITOR_ADDRESS };
+  const { db, service, txs } = makeReviewService({ projectAuthPubkey: null });
+  txs.set(
+    PROJECT_TOKEN_ID,
+    makeTx({
+      txid: PROJECT_TOKEN_ID,
+      authorAddress: genesisAuthorAddress.value,
+    }),
+  );
+  txs.set(
+    txid,
+    makeTx({
+      txid,
+      authorAddress: PROJECT_EDITOR_ADDRESS,
+      paidSats: 100_000_000n,
+    }),
+  );
+
+  try {
+    const invoice = await service.createProjectInfoInvoice(PROJECT_TOKEN_ID, {
+      editorAddress: PROJECT_EDITOR_ADDRESS,
+      description: "Project info",
+    });
+    genesisAuthorAddress.value = REVIEW_AUTHOR_ADDRESS;
+    txs.set(
+      PROJECT_TOKEN_ID,
+      makeTx({
+        txid: PROJECT_TOKEN_ID,
+        authorAddress: genesisAuthorAddress.value,
+      }),
+    );
+
+    await assert.rejects(
+      () => service.submitProjectInfoInvoiceTx(invoice.invoiceId, { txid }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PROJECT_INFO_CREATOR_REQUIRED",
     );
     assert.equal(
       service.getProjectInfoInvoice(invoice.invoiceId)?.status,

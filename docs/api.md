@@ -76,6 +76,7 @@ For machine-readable tooling, use [../openapi.yaml](../openapi.yaml).
 - `PROJECT_INFO_PAYMENTS_DISABLED`
 - `PROJECT_INFO_PAYMENT_CONFIG_INVALID`
 - `PROJECT_INFO_AUTH_PUBKEY_REQUIRED`
+- `PROJECT_INFO_CREATOR_REQUIRED`
 - `METHOD_NOT_ALLOWED`
 - `NOT_FOUND`
 - `INTERNAL_ERROR`
@@ -450,7 +451,7 @@ curl -X POST "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/invoices" \
 
 ## Project info
 
-Each token can publish one current project info record with `description`, `websiteUrl`, `xUrl`, and `telegramUrl`. Only the eCash p2pkh address derived from the token genesis `authPubkey` may create a paid invoice to change it.
+Each token can publish one current project info record with `description`, `websiteUrl`, `xUrl`, and `telegramUrl`. Only the token creator address may create a paid invoice to change it. The creator is resolved from the token genesis `authPubkey` when present, or from the first decodable input address of the token genesis tx when `authPubkey` is absent.
 
 Fee schedule:
 
@@ -463,7 +464,7 @@ Returns the current published project info, or `null` if none exists yet.
 
 ### `POST /api/tokens/:tokenId/project-info/invoices`
 
-Creates a pending invoice for publishing or updating project info. The `editorAddress` must match the eCash p2pkh address derived from the token genesis `authPubkey`.
+Creates a pending invoice for publishing or updating project info. The `editorAddress` must match the token creator address resolved by the server from Chronik.
 
 Request body:
 

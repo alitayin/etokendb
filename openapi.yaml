@@ -264,7 +264,7 @@ paths:
       tags: [Tokens, ProjectInfo]
       summary: Create a paid project info invoice
       operationId: createProjectInfoInvoice
-      description: Requires `editorAddress` to match the eCash p2pkh address derived from the token genesis `authPubkey`.
+      description: Requires `editorAddress` to match the token creator address resolved from Chronik. The server uses the token genesis `authPubkey` when present, or the first decodable input address of the token genesis tx when `authPubkey` is absent.
       parameters:
         - $ref: "#/components/parameters/TokenIdPathParam"
       requestBody:
