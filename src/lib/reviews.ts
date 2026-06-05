@@ -10,6 +10,32 @@ export const REVIEW_INVOICE_VERIFIER_MAX_SATS = 9_999;
 export const REVIEW_DEFAULT_BASE_FEE_SATS = 10_000_000;
 export const REVIEW_DEFAULT_INVOICE_TTL_MS = 30 * 60 * 1000;
 export const REVIEW_DEFAULT_RETRY_INTERVAL_MS = 60 * 1000;
+export const REVIEW_STAR_SHARD_TOKEN_ID =
+  "d1131675cb62b65909fb45ba53b022da0bd0f34aaa71fc61770115472b186ffb";
+export const REVIEW_STAR_CRYSTAL_TOKEN_ID =
+  "ac31bb0bccf33de1683efce4da64f1cb6d8e8d6e098bc01c51d5864deb0e783f";
+
+export type ReviewPaymentKind = "xec" | "token";
+export type ReviewPaymentTokenSymbol = "SS" | "SC";
+
+export interface ReviewPaymentTokenConfig {
+  symbol: ReviewPaymentTokenSymbol;
+  tokenId: string;
+  creditSatsPerAtom: number;
+}
+
+export const REVIEW_PAYMENT_TOKEN_CONFIGS: ReviewPaymentTokenConfig[] = [
+  {
+    symbol: "SS",
+    tokenId: REVIEW_STAR_SHARD_TOKEN_ID,
+    creditSatsPerAtom: 500,
+  },
+  {
+    symbol: "SC",
+    tokenId: REVIEW_STAR_CRYSTAL_TOKEN_ID,
+    creditSatsPerAtom: 30_000,
+  },
+];
 
 export type ReviewInvoiceStatus =
   | "pending"
@@ -27,6 +53,11 @@ export interface ReviewInvoiceRecord {
   paymentAddress: string;
   expectedPaidSats: number;
   verifierSats: number;
+  paymentKind: ReviewPaymentKind;
+  paymentTokenId: string | null;
+  paymentTokenSymbol: ReviewPaymentTokenSymbol | null;
+  creditSatsPerAtom: number | null;
+  expectedPaidAtoms: string | null;
   status: ReviewInvoiceStatus;
   paymentTxid: string | null;
   expiresAt: number;
@@ -44,6 +75,11 @@ export interface CreateReviewInvoiceRecord {
   paymentAddress: string;
   expectedPaidSats: number;
   verifierSats: number;
+  paymentKind?: ReviewPaymentKind;
+  paymentTokenId?: string | null;
+  paymentTokenSymbol?: ReviewPaymentTokenSymbol | null;
+  creditSatsPerAtom?: number | null;
+  expectedPaidAtoms?: string | null;
   expiresAt: number;
   createdAt: number;
 }
@@ -204,6 +240,81 @@ export function normalizeVerifierSats(value: number): number {
   return value;
 }
 
+export function getReviewPaymentTokenConfig(
+  symbol: ReviewPaymentTokenSymbol,
+): ReviewPaymentTokenConfig {
+  const config = REVIEW_PAYMENT_TOKEN_CONFIGS.find(
+    (entry) => entry.symbol === symbol,
+  );
+  if (!config) {
+    throw new ReviewError(
+      400,
+      "INVALID_REVIEW_PAYMENT_TOKEN",
+      "paymentTokenSymbol must be SS or SC",
+    );
+  }
+  return config;
+}
+
+export function normalizeReviewPaymentKind(
+  value: unknown,
+): ReviewPaymentKind {
+  if (value === undefined || value === null || value === "") {
+    return "xec";
+  }
+  if (value === "xec" || value === "token") {
+    return value;
+  }
+  throw new ReviewError(
+    400,
+    "INVALID_REVIEW_PAYMENT_KIND",
+    "paymentKind must be xec or token",
+  );
+}
+
+export function normalizeReviewPaymentTokenSymbol(
+  value: unknown,
+): ReviewPaymentTokenSymbol {
+  if (value === "SS" || value === "SC") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const upperValue = value.trim().toUpperCase();
+    if (upperValue === "SS" || upperValue === "SC") {
+      return upperValue;
+    }
+  }
+  throw new ReviewError(
+    400,
+    "INVALID_REVIEW_PAYMENT_TOKEN",
+    "paymentTokenSymbol must be SS or SC",
+  );
+}
+
+export function calculateExpectedPaidAtoms(
+  requiredSats: number,
+  creditSatsPerAtom: number,
+): string {
+  if (!Number.isInteger(requiredSats) || requiredSats <= 0) {
+    throw new ReviewError(
+      500,
+      "INVALID_REVIEW_PAYMENT_AMOUNT",
+      "required sats must be a positive integer",
+    );
+  }
+  if (!Number.isInteger(creditSatsPerAtom) || creditSatsPerAtom <= 0) {
+    throw new ReviewError(
+      500,
+      "INVALID_REVIEW_PAYMENT_TOKEN",
+      "creditSatsPerAtom must be a positive integer",
+    );
+  }
+
+  const sats = BigInt(requiredSats);
+  const credit = BigInt(creditSatsPerAtom);
+  return ((sats + credit - 1n) / credit).toString();
+}
+
 export function satsToXecString(sats: number): string {
   const whole = Math.floor(sats / 100);
   const fraction = Math.abs(sats % 100).toString().padStart(2, "0");
@@ -225,7 +336,15 @@ export function verifyReviewPaymentTx(params: {
   txid: string;
   invoice: Pick<
     ReviewInvoiceRecord,
-    "authorAddress" | "paymentAddress" | "expectedPaidSats"
+    | "authorAddress"
+    | "paymentAddress"
+    | "expectedPaidSats"
+    | "paymentKind"
+    | "paymentTokenId"
+    | "paymentTokenSymbol"
+    | "creditSatsPerAtom"
+    | "expectedPaidAtoms"
+    | "createdAt"
   >;
   nowMs: number;
 }): ReviewPaymentVerification {
@@ -259,6 +378,23 @@ export function verifyReviewPaymentTx(params: {
     );
   }
 
+  const paymentSeenAt = getReviewPaymentSeenAt(params.tx, params.nowMs);
+  if (params.invoice.paymentKind === "token") {
+    verifyReviewTokenPaymentTx({
+      tx: params.tx,
+      invoice: params.invoice,
+      authorOutputScript,
+      paymentOutputScript,
+      paymentSeenAt,
+    });
+    return {
+      paidSats: params.invoice.expectedPaidSats,
+      paymentSeenAt,
+      paymentBlockHeight: params.tx.block?.height ?? null,
+      paymentBlockTimestamp: params.tx.block?.timestamp ?? null,
+    };
+  }
+
   const hasExactPaymentOutput = params.tx.outputs.some(
     (output) =>
       output.outputScript.toLowerCase() === paymentOutputScript &&
@@ -274,11 +410,99 @@ export function verifyReviewPaymentTx(params: {
 
   return {
     paidSats: params.invoice.expectedPaidSats,
-    paymentSeenAt:
-      Number.isFinite(params.tx.timeFirstSeen) && params.tx.timeFirstSeen > 0
-        ? params.tx.timeFirstSeen * 1000
-        : params.nowMs,
+    paymentSeenAt,
     paymentBlockHeight: params.tx.block?.height ?? null,
     paymentBlockTimestamp: params.tx.block?.timestamp ?? null,
   };
+}
+
+function getReviewPaymentSeenAt(tx: Tx, nowMs: number): number {
+  if (Number.isFinite(tx.timeFirstSeen) && tx.timeFirstSeen > 0) {
+    return tx.timeFirstSeen * 1000;
+  }
+  if (
+    tx.block &&
+    Number.isFinite(tx.block.timestamp) &&
+    tx.block.timestamp > 0
+  ) {
+    return tx.block.timestamp * 1000;
+  }
+  return nowMs;
+}
+
+function verifyReviewTokenPaymentTx(params: {
+  tx: Tx;
+  invoice: Pick<
+    ReviewInvoiceRecord,
+    | "paymentTokenId"
+    | "paymentTokenSymbol"
+    | "creditSatsPerAtom"
+    | "expectedPaidAtoms"
+    | "createdAt"
+  >;
+  authorOutputScript: string;
+  paymentOutputScript: string;
+  paymentSeenAt: number;
+}): void {
+  const tokenId = params.invoice.paymentTokenId?.toLowerCase();
+  const expectedPaidAtomsRaw = params.invoice.expectedPaidAtoms;
+  if (
+    !tokenId ||
+    !params.invoice.paymentTokenSymbol ||
+    !params.invoice.creditSatsPerAtom ||
+    !expectedPaidAtomsRaw
+  ) {
+    throw new ReviewError(
+      500,
+      "REVIEW_PAYMENT_CONFIG_INVALID",
+      "token review invoice is missing payment token configuration",
+    );
+  }
+
+  const expectedPaidAtoms = BigInt(expectedPaidAtomsRaw);
+  if (expectedPaidAtoms <= 0n) {
+    throw new ReviewError(
+      500,
+      "REVIEW_PAYMENT_CONFIG_INVALID",
+      "token review invoice expected atoms must be positive",
+    );
+  }
+
+  if (params.paymentSeenAt < params.invoice.createdAt) {
+    throw new ReviewError(
+      400,
+      "PAYMENT_BEFORE_INVOICE",
+      "token payment tx must be first seen after the invoice was created",
+    );
+  }
+
+  const hasAuthorTokenInput = params.tx.inputs.some(
+    (input) =>
+      input.outputScript?.toLowerCase() === params.authorOutputScript &&
+      input.token?.tokenId.toLowerCase() === tokenId &&
+      input.token.isMintBaton !== true &&
+      input.token.atoms > 0n,
+  );
+  if (!hasAuthorTokenInput) {
+    throw new ReviewError(
+      400,
+      "PAYMENT_AUTHOR_MISMATCH",
+      "token payment tx must spend the expected token from authorAddress",
+    );
+  }
+
+  const hasTokenPaymentOutput = params.tx.outputs.some(
+    (output) =>
+      output.outputScript.toLowerCase() === params.paymentOutputScript &&
+      output.token?.tokenId.toLowerCase() === tokenId &&
+      output.token.isMintBaton !== true &&
+      output.token.atoms >= expectedPaidAtoms,
+  );
+  if (!hasTokenPaymentOutput) {
+    throw new ReviewError(
+      400,
+      "PAYMENT_OUTPUT_MISMATCH",
+      "payment tx must pay at least the expected token atoms to the configured review address",
+    );
+  }
 }

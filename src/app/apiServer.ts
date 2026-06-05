@@ -815,6 +815,17 @@ async function routeRequest(
           ? undefined
           : (body.comment as string),
     };
+    if (body.paymentKind !== undefined && body.paymentKind !== null) {
+      input.paymentKind =
+        body.paymentKind as CreateReviewInvoiceInput["paymentKind"];
+    }
+    if (
+      body.paymentTokenSymbol !== undefined &&
+      body.paymentTokenSymbol !== null
+    ) {
+      input.paymentTokenSymbol =
+        body.paymentTokenSymbol as CreateReviewInvoiceInput["paymentTokenSymbol"];
+    }
     sendJson(res, 201, {
       ok: true,
       data: await dataService.createReviewInvoice(segments[2], input),

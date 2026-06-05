@@ -447,6 +447,11 @@ function createSchema(sqlite: Database.Database): void {
       payment_address TEXT NOT NULL,
       expected_paid_sats INTEGER NOT NULL,
       verifier_sats INTEGER NOT NULL,
+      payment_kind TEXT NOT NULL DEFAULT 'xec',
+      payment_token_id TEXT,
+      payment_token_symbol TEXT,
+      credit_sats_per_atom INTEGER,
+      expected_paid_atoms TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       payment_txid TEXT,
       expires_at INTEGER NOT NULL,
@@ -597,6 +602,16 @@ function createSchema(sqlite: Database.Database): void {
     "last_trade_price_nanosats_per_atom",
     "TEXT",
   );
+  ensureColumn(
+    sqlite,
+    "review_invoices",
+    "payment_kind",
+    "TEXT NOT NULL DEFAULT 'xec'",
+  );
+  ensureColumn(sqlite, "review_invoices", "payment_token_id", "TEXT");
+  ensureColumn(sqlite, "review_invoices", "payment_token_symbol", "TEXT");
+  ensureColumn(sqlite, "review_invoices", "credit_sats_per_atom", "INTEGER");
+  ensureColumn(sqlite, "review_invoices", "expected_paid_atoms", "TEXT");
 }
 
 function toNullableNumber(value: unknown): number | null {
@@ -817,6 +832,14 @@ function toReviewInvoiceRecord(
     paymentAddress: row.payment_address as string,
     expectedPaidSats: Number(row.expected_paid_sats),
     verifierSats: Number(row.verifier_sats),
+    paymentKind: row.payment_kind === "token" ? "token" : "xec",
+    paymentTokenId: (row.payment_token_id as string | null) ?? null,
+    paymentTokenSymbol:
+      row.payment_token_symbol === "SS" || row.payment_token_symbol === "SC"
+        ? row.payment_token_symbol
+        : null,
+    creditSatsPerAtom: toNullableNumber(row.credit_sats_per_atom),
+    expectedPaidAtoms: (row.expected_paid_atoms as string | null) ?? null,
     status: row.status as ReviewInvoiceStatus,
     paymentTxid: (row.payment_txid as string | null) ?? null,
     expiresAt: Number(row.expires_at),
@@ -1867,6 +1890,11 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       payment_address,
       expected_paid_sats,
       verifier_sats,
+      payment_kind,
+      payment_token_id,
+      payment_token_symbol,
+      credit_sats_per_atom,
+      expected_paid_atoms,
       status,
       payment_txid,
       expires_at,
@@ -1882,6 +1910,11 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       @paymentAddress,
       @expectedPaidSats,
       @verifierSats,
+      @paymentKind,
+      @paymentTokenId,
+      @paymentTokenSymbol,
+      @creditSatsPerAtom,
+      @expectedPaidAtoms,
       'pending',
       NULL,
       @expiresAt,
@@ -1901,6 +1934,11 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       payment_address,
       expected_paid_sats,
       verifier_sats,
+      payment_kind,
+      payment_token_id,
+      payment_token_symbol,
+      credit_sats_per_atom,
+      expected_paid_atoms,
       status,
       payment_txid,
       expires_at,
@@ -1921,6 +1959,11 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       payment_address,
       expected_paid_sats,
       verifier_sats,
+      payment_kind,
+      payment_token_id,
+      payment_token_symbol,
+      credit_sats_per_atom,
+      expected_paid_atoms,
       status,
       payment_txid,
       expires_at,
@@ -1967,6 +2010,11 @@ export function openDatabase(sqlitePath: string): AppDatabase {
       payment_address,
       expected_paid_sats,
       verifier_sats,
+      payment_kind,
+      payment_token_id,
+      payment_token_symbol,
+      credit_sats_per_atom,
+      expected_paid_atoms,
       status,
       payment_txid,
       expires_at,
@@ -2986,7 +3034,14 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     publishTokenProjectInfo: (info, updatedAt) =>
       publishTokenProjectInfoTx(info, updatedAt),
     createReviewInvoice: (invoice) => {
-      insertReviewInvoiceStmt.run(invoice);
+      insertReviewInvoiceStmt.run({
+        ...invoice,
+        paymentKind: invoice.paymentKind ?? "xec",
+        paymentTokenId: invoice.paymentTokenId ?? null,
+        paymentTokenSymbol: invoice.paymentTokenSymbol ?? null,
+        creditSatsPerAtom: invoice.creditSatsPerAtom ?? null,
+        expectedPaidAtoms: invoice.expectedPaidAtoms ?? null,
+      });
       const row = getReviewInvoiceStmt.get(invoice.invoiceId) as
         | Record<string, unknown>
         | undefined;

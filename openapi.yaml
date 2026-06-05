@@ -223,6 +223,11 @@ paths:
     post:
       tags: [Tokens, Reviews]
       summary: Create a paid review invoice
+      description: |
+        Creates an invoice denominated in XEC/sats. By default, the invoice is paid
+        with an exact XEC output. If `paymentKind` is `token`, the invoice may be
+        paid once with SS or SC token atoms. Token payments may overpay; excess
+        token atoms are not saved as credit and are not applied to future invoices.
       operationId: createReviewInvoice
       parameters:
         - $ref: "#/components/parameters/TokenIdPathParam"
@@ -306,6 +311,12 @@ paths:
     post:
       tags: [Reviews]
       summary: Submit a review payment transaction id
+      description: |
+        For XEC invoices, the transaction must pay exactly `expectedPaidSats` to
+        `paymentAddress`. For token invoices, the transaction must spend the
+        selected token from `authorAddress` and pay at least `expectedPaidAtoms`
+        of the selected token to `paymentAddress`; overpayment is accepted but not
+        stored as reusable credit.
       operationId: submitReviewInvoiceTx
       parameters:
         - $ref: "#/components/parameters/InvoiceIdPathParam"
@@ -1014,6 +1025,16 @@ components:
       enum:
         - initial
         - update
+    ReviewPaymentKind:
+      type: string
+      enum:
+        - xec
+        - token
+    ReviewPaymentTokenSymbol:
+      type: string
+      enum:
+        - SS
+        - SC
     CreateReviewInvoiceRequest:
       type: object
       required: [authorAddress, score]
@@ -1028,6 +1049,13 @@ components:
           type: string
           maxLength: 500
           description: Maximum 500 UTF-8 bytes.
+        paymentKind:
+          $ref: "#/components/schemas/ReviewPaymentKind"
+          default: xec
+        paymentTokenSymbol:
+          allOf:
+            - $ref: "#/components/schemas/ReviewPaymentTokenSymbol"
+          description: Required when `paymentKind` is `token`. Ignored for XEC invoices.
     SubmitReviewInvoiceTxRequest:
       type: object
       required: [txid]
@@ -1071,6 +1099,11 @@ components:
         - paymentAddress
         - expectedPaidSats
         - expectedPaidXec
+        - paymentKind
+        - paymentTokenId
+        - paymentTokenSymbol
+        - creditSatsPerAtom
+        - expectedPaidAtoms
         - status
         - expiresAt
         - paymentTxid
@@ -1095,6 +1128,24 @@ components:
           type: integer
         expectedPaidXec:
           type: string
+        paymentKind:
+          $ref: "#/components/schemas/ReviewPaymentKind"
+        paymentTokenId:
+          type: string
+          nullable: true
+          pattern: "^[0-9a-fA-F]{64}$"
+        paymentTokenSymbol:
+          anyOf:
+            - $ref: "#/components/schemas/ReviewPaymentTokenSymbol"
+            - type: "null"
+        creditSatsPerAtom:
+          type: integer
+          nullable: true
+          description: Sats of invoice value covered by one paid token atom.
+        expectedPaidAtoms:
+          type: string
+          nullable: true
+          description: Minimum token atoms required for token invoices.
         status:
           $ref: "#/components/schemas/ReviewInvoiceStatus"
         expiresAt:

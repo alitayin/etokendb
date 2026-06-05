@@ -24,9 +24,13 @@ import {
   REVIEW_INVOICE_VERIFIER_MAX_SATS,
   REVIEW_INVOICE_VERIFIER_MIN_SATS,
   ReviewError,
+  calculateExpectedPaidAtoms,
+  getReviewPaymentTokenConfig,
   maskEcashAddress,
   normalizeComment,
   normalizeEcashAddress,
+  normalizeReviewPaymentKind,
+  normalizeReviewPaymentTokenSymbol,
   normalizeScore,
   normalizeTokenId,
   normalizeTxid,
@@ -380,6 +384,11 @@ function toReviewInvoice(record: ReviewInvoiceRecord) {
     paymentAddress: record.paymentAddress,
     expectedPaidSats: record.expectedPaidSats,
     expectedPaidXec: satsToXecString(record.expectedPaidSats),
+    paymentKind: record.paymentKind,
+    paymentTokenId: record.paymentTokenId,
+    paymentTokenSymbol: record.paymentTokenSymbol,
+    creditSatsPerAtom: record.creditSatsPerAtom,
+    expectedPaidAtoms: record.expectedPaidAtoms,
     status: record.status,
     expiresAt: record.expiresAt,
     paymentTxid: record.paymentTxid,
@@ -875,6 +884,19 @@ export class AgoraTokenService implements ServiceReadApi {
     );
     const nowMs = this.nowMs();
     const expectedPaidSats = this.config.reviewBaseFeeSats + verifierSats;
+    const paymentKind = normalizeReviewPaymentKind(input.paymentKind);
+    const paymentTokenConfig =
+      paymentKind === "token"
+        ? getReviewPaymentTokenConfig(
+            normalizeReviewPaymentTokenSymbol(input.paymentTokenSymbol),
+          )
+        : null;
+    const expectedPaidAtoms = paymentTokenConfig
+      ? calculateExpectedPaidAtoms(
+          expectedPaidSats,
+          paymentTokenConfig.creditSatsPerAtom,
+        )
+      : null;
 
     return toReviewInvoice(
       this.db.createReviewInvoice({
@@ -886,6 +908,11 @@ export class AgoraTokenService implements ServiceReadApi {
         paymentAddress,
         expectedPaidSats,
         verifierSats,
+        paymentKind,
+        paymentTokenId: paymentTokenConfig?.tokenId ?? null,
+        paymentTokenSymbol: paymentTokenConfig?.symbol ?? null,
+        creditSatsPerAtom: paymentTokenConfig?.creditSatsPerAtom ?? null,
+        expectedPaidAtoms,
         expiresAt: nowMs + this.config.reviewInvoiceTtlMs,
         createdAt: nowMs,
       }),

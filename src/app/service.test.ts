@@ -5,7 +5,11 @@ import { encodeOutputScript, getOutputScriptFromAddress } from "ecashaddrjs";
 
 import { openDatabase } from "../lib/db.js";
 import type { AppConfig } from "../lib/config.js";
-import { ReviewError } from "../lib/reviews.js";
+import {
+  REVIEW_STAR_CRYSTAL_TOKEN_ID,
+  REVIEW_STAR_SHARD_TOKEN_ID,
+  ReviewError,
+} from "../lib/reviews.js";
 import { AgoraTokenService } from "./service.js";
 
 function makeProcessedTrade(params: {
@@ -122,6 +126,78 @@ function makeTx(params: {
           },
     timeFirstSeen: params.timeFirstSeen ?? 0,
     size: 100,
+    isCoinbase: false,
+    tokenEntries: [],
+    tokenFailedParsings: [],
+    tokenStatus: "TOKEN_STATUS_NORMAL",
+    isFinal: true,
+  } as never;
+}
+
+function makeTokenTx(params: {
+  txid: string;
+  tokenId: string;
+  authorAddress?: string;
+  paymentAddress?: string;
+  inputTokenId?: string;
+  outputTokenId?: string;
+  inputAtoms?: bigint;
+  paidAtoms?: bigint;
+  timeFirstSeen?: number;
+  blockHeight?: number;
+  blockTimestamp?: number;
+  mintBatonOutput?: boolean;
+}) {
+  const tokenType = {
+    protocol: "SLP",
+    type: "SLP_TOKEN_TYPE_FUNGIBLE",
+    number: 1,
+  };
+  return {
+    txid: params.txid,
+    version: 2,
+    inputs: [
+      {
+        prevOut: { txid: "1".repeat(64), outIdx: 0 },
+        inputScript: "",
+        outputScript: getOutputScriptFromAddress(
+          params.authorAddress ?? REVIEW_AUTHOR_ADDRESS,
+        ),
+        sats: 546n,
+        sequenceNo: 0,
+        token: {
+          tokenId: params.inputTokenId ?? params.tokenId,
+          tokenType,
+          atoms: params.inputAtoms ?? 100n,
+          isMintBaton: false,
+        },
+      },
+    ],
+    outputs: [
+      {
+        outputScript: getOutputScriptFromAddress(
+          params.paymentAddress ?? REVIEW_PAYMENT_ADDRESS,
+        ),
+        sats: 546n,
+        token: {
+          tokenId: params.outputTokenId ?? params.tokenId,
+          tokenType,
+          atoms: params.paidAtoms ?? 100n,
+          isMintBaton: params.mintBatonOutput ?? false,
+        },
+      },
+    ],
+    lockTime: 0,
+    block:
+      params.blockHeight === undefined
+        ? undefined
+        : {
+            height: params.blockHeight,
+            hash: "block-hash",
+            timestamp: params.blockTimestamp ?? 0,
+          },
+    timeFirstSeen: params.timeFirstSeen ?? 0,
+    size: 120,
     isCoinbase: false,
     tokenEntries: [],
     tokenFailedParsings: [],
@@ -419,6 +495,151 @@ test("review invoice submit stores tx_submitted until Chronik indexes tx", async
       expired: 0,
     });
     assert.equal(service.getReviewInvoice(invoice.invoiceId)?.status, "published");
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice can be paid with overpaid SS token atoms", async () => {
+  const txid = "1".repeat(64);
+  const { db, service, txs } = makeReviewService();
+
+  try {
+    const invoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 9,
+      comment: "paid with ss",
+      paymentKind: "token",
+      paymentTokenSymbol: "SS",
+    });
+
+    assert.equal(invoice.paymentKind, "token");
+    assert.equal(invoice.paymentTokenId, REVIEW_STAR_SHARD_TOKEN_ID);
+    assert.equal(invoice.paymentTokenSymbol, "SS");
+    assert.equal(invoice.creditSatsPerAtom, 500);
+    assert.equal(invoice.expectedPaidAtoms, "3");
+
+    txs.set(
+      txid,
+      makeTokenTx({
+        txid,
+        tokenId: REVIEW_STAR_SHARD_TOKEN_ID,
+        paidAtoms: 4n,
+        timeFirstSeen: 11,
+      }),
+    );
+
+    const submitted = await service.submitReviewInvoiceTx(invoice.invoiceId, {
+      txid,
+    });
+    assert.equal(submitted.status, "published");
+    assert.equal(submitted.paymentTxid, txid);
+    assert.equal(submitted.publishedReviewId, "review-1");
+  } finally {
+    db.close();
+  }
+});
+
+test("review invoice can be paid with exact SC token atoms", async () => {
+  const txid = "2".repeat(64);
+  const { db, service, txs } = makeReviewService();
+
+  try {
+    const invoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 9,
+      paymentKind: "token",
+      paymentTokenSymbol: "SC",
+    });
+
+    assert.equal(invoice.paymentKind, "token");
+    assert.equal(invoice.paymentTokenId, REVIEW_STAR_CRYSTAL_TOKEN_ID);
+    assert.equal(invoice.paymentTokenSymbol, "SC");
+    assert.equal(invoice.creditSatsPerAtom, 30_000);
+    assert.equal(invoice.expectedPaidAtoms, "1");
+
+    txs.set(
+      txid,
+      makeTokenTx({
+        txid,
+        tokenId: REVIEW_STAR_CRYSTAL_TOKEN_ID,
+        paidAtoms: 1n,
+        timeFirstSeen: 11,
+      }),
+    );
+
+    const submitted = await service.submitReviewInvoiceTx(invoice.invoiceId, {
+      txid,
+    });
+    assert.equal(submitted.status, "published");
+  } finally {
+    db.close();
+  }
+});
+
+test("review token invoice rejects underpaid or wrong token txs", async () => {
+  const underpaidTxid = "3".repeat(64);
+  const wrongTokenTxid = "4".repeat(64);
+  const { db, service, txs } = makeReviewService();
+
+  txs.set(
+    underpaidTxid,
+    makeTokenTx({
+      txid: underpaidTxid,
+      tokenId: REVIEW_STAR_SHARD_TOKEN_ID,
+      paidAtoms: 2n,
+      timeFirstSeen: 11,
+    }),
+  );
+  txs.set(
+    wrongTokenTxid,
+    makeTokenTx({
+      txid: wrongTokenTxid,
+      tokenId: REVIEW_STAR_CRYSTAL_TOKEN_ID,
+      timeFirstSeen: 11,
+    }),
+  );
+
+  try {
+    const underpaidInvoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+      paymentKind: "token",
+      paymentTokenSymbol: "SS",
+    });
+    await assert.rejects(
+      () =>
+        service.submitReviewInvoiceTx(underpaidInvoice.invoiceId, {
+          txid: underpaidTxid,
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_OUTPUT_MISMATCH",
+    );
+    assert.equal(
+      service.getReviewInvoice(underpaidInvoice.invoiceId)?.status,
+      "invalid",
+    );
+
+    const wrongTokenInvoice = service.createReviewInvoice(REVIEW_TOKEN_ID, {
+      authorAddress: REVIEW_AUTHOR_ADDRESS,
+      score: 6,
+      paymentKind: "token",
+      paymentTokenSymbol: "SS",
+    });
+    await assert.rejects(
+      () =>
+        service.submitReviewInvoiceTx(wrongTokenInvoice.invoiceId, {
+          txid: wrongTokenTxid,
+        }),
+      (error) =>
+        error instanceof ReviewError &&
+        error.code === "PAYMENT_AUTHOR_MISMATCH",
+    );
+    assert.equal(
+      service.getReviewInvoice(wrongTokenInvoice.invoiceId)?.status,
+      "invalid",
+    );
   } finally {
     db.close();
   }

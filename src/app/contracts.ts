@@ -224,11 +224,15 @@ export type ReviewInvoiceStatus =
 export type ProjectInfoInvoiceStatus = ReviewInvoiceStatus;
 
 export type ProjectInfoFeeTier = "initial" | "update";
+export type ReviewPaymentKind = "xec" | "token";
+export type ReviewPaymentTokenSymbol = "SS" | "SC";
 
 export interface CreateReviewInvoiceInput {
   authorAddress: string;
   score: number;
   comment?: string;
+  paymentKind?: ReviewPaymentKind;
+  paymentTokenSymbol?: ReviewPaymentTokenSymbol;
 }
 
 export interface SubmitReviewInvoiceTxInput {
@@ -259,6 +263,11 @@ export interface ReviewInvoice {
   paymentAddress: string;
   expectedPaidSats: number;
   expectedPaidXec: string;
+  paymentKind: ReviewPaymentKind;
+  paymentTokenId: string | null;
+  paymentTokenSymbol: ReviewPaymentTokenSymbol | null;
+  creditSatsPerAtom: number | null;
+  expectedPaidAtoms: string | null;
   status: ReviewInvoiceStatus;
   expiresAt: number;
   paymentTxid: string | null;

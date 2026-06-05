@@ -418,13 +418,15 @@ curl "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews?page=1&pageSize=20"
 
 ### `POST /api/tokens/:tokenId/reviews/invoices`
 
-Creates a pending invoice for one paid review. The response includes the configured payment address and exact amount to pay.
+Creates a pending invoice for one paid review. The invoice is denominated in XEC/sats. By default it is paid with XEC, but callers may request a one-time SS or SC token payment instead.
 
 Request body:
 
 - `authorAddress`: connected eCash address
 - `score`: integer from `0` to `10`
 - `comment`: optional string, max 500 UTF-8 bytes
+- `paymentKind`: optional, `xec` or `token`, default `xec`
+- `paymentTokenSymbol`: required when `paymentKind` is `token`; currently `SS` or `SC`
 
 Response `data`:
 
@@ -436,10 +438,21 @@ Response `data`:
 - `paymentAddress`
 - `expectedPaidSats`
 - `expectedPaidXec`
+- `paymentKind`: `xec` or `token`
+- `paymentTokenId`: token id for token invoices, otherwise `null`
+- `paymentTokenSymbol`: `SS` or `SC` for token invoices, otherwise `null`
+- `creditSatsPerAtom`: sats of invoice value covered by one token atom, otherwise `null`
+- `expectedPaidAtoms`: minimum token atoms required for token invoices, otherwise `null`
 - `status`
 - `expiresAt`
 - `paymentTxid`
 - `publishedReviewId`
+
+Payment rules:
+
+- XEC invoices require an output paying exactly `expectedPaidSats` to `paymentAddress`.
+- Token invoices require the transaction to spend the selected token from `authorAddress` and pay at least `expectedPaidAtoms` of that token to `paymentAddress`.
+- Token overpayment is accepted, but excess atoms are not saved as credit and are not applied to future invoices.
 
 Example:
 
@@ -447,6 +460,10 @@ Example:
 curl -X POST "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/invoices" \
   -H "content-type: application/json" \
   -d '{"authorAddress":"ecash:...","score":8,"comment":"optional"}'
+
+curl -X POST "http://127.0.0.1:8787/api/tokens/<tokenId>/reviews/invoices" \
+  -H "content-type: application/json" \
+  -d '{"authorAddress":"ecash:...","score":8,"paymentKind":"token","paymentTokenSymbol":"SS"}'
 ```
 
 ## Project info
@@ -511,7 +528,7 @@ curl "http://127.0.0.1:8787/api/review-invoices/<invoiceId>"
 
 ### `POST /api/review-invoices/:invoiceId/submit-tx`
 
-Submits a payment transaction id for verification. The transaction must spend at least one input from `authorAddress` and pay exactly `expectedPaidSats` to `paymentAddress`. Mempool transactions are accepted. If Chronik has not indexed the tx yet, the invoice remains `tx_submitted` and the background retry loop can publish it later.
+Submits a payment transaction id for verification. For XEC invoices, the transaction must spend at least one input from `authorAddress` and pay exactly `expectedPaidSats` to `paymentAddress`. For token invoices, it must spend the selected token from `authorAddress` and pay at least `expectedPaidAtoms` of that token to `paymentAddress`; mint baton outputs do not count. Token overpayment is accepted but not saved as reusable credit. Mempool transactions are accepted. If Chronik has not indexed the tx yet, the invoice remains `tx_submitted` and the background retry loop can publish it later.
 
 Request body:
 

@@ -282,6 +282,11 @@ function sampleReviewInvoice(status: ReviewInvoice["status"] = "pending"): Revie
     paymentAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
     expectedPaidSats: 10_000_123,
     expectedPaidXec: "100001.23",
+    paymentKind: "xec",
+    paymentTokenId: null,
+    paymentTokenSymbol: null,
+    creditSatsPerAtom: null,
+    expectedPaidAtoms: null,
     status,
     expiresAt: 1_000_000,
     paymentTxid: null,
@@ -811,6 +816,54 @@ test("review endpoints expose summaries, lists, invoices, and tx submission", as
     `/api/tokens/${tokenId}/reviews/invoices`,
   );
   assert.equal(wrongMethod.statusCode, 405);
+});
+
+test("review invoice creation forwards token payment options", async () => {
+  const tokenId = "a".repeat(64);
+  const service: ApiDataService = {
+    ...makeBaseService(),
+    createReviewInvoice: (receivedTokenId, input) => {
+      assert.equal(receivedTokenId, tokenId);
+      assert.deepEqual(input, {
+        authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+        score: 9,
+        comment: undefined,
+        paymentKind: "token",
+        paymentTokenSymbol: "SS",
+      });
+      return {
+        ...sampleReviewInvoice(),
+        paymentKind: "token",
+        paymentTokenId: "d".repeat(64),
+        paymentTokenSymbol: "SS",
+        creditSatsPerAtom: 500,
+        expectedPaidAtoms: "20001",
+      };
+    },
+  };
+
+  const created = await invoke(
+    service,
+    "POST",
+    `/api/tokens/${tokenId}/reviews/invoices`,
+    {},
+    {
+      authorAddress: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+      score: 9,
+      paymentKind: "token",
+      paymentTokenSymbol: "SS",
+    },
+  );
+
+  assert.equal(created.statusCode, 201);
+  assert.equal(
+    ((created.bodyJson as { data: ReviewInvoice }).data).paymentKind,
+    "token",
+  );
+  assert.equal(
+    ((created.bodyJson as { data: ReviewInvoice }).data).expectedPaidAtoms,
+    "20001",
+  );
 });
 
 test("project info endpoints expose current info, invoices, and tx submission", async () => {
