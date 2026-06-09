@@ -1410,6 +1410,91 @@ test("service performs a polling catch-up before ready when websocket bootstrap 
   }
 });
 
+test("service performs tail catch-up after websocket reconnect", async () => {
+  const db = openDatabase(":memory:");
+  const modes: string[] = [];
+  let wsConfig:
+    | {
+        onConnect?: (event: unknown) => void;
+        onReconnect?: (event: unknown) => void;
+      }
+    | undefined;
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: (config) => {
+          wsConfig = config as typeof wsConfig;
+          return {
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          } as never;
+        },
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 900_000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => {
+          throw new Error("unused");
+        },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+      ops: {
+        discoverActiveTokens: async () => [
+          {
+            tokenId: "token-reconnect",
+            groupHex: "46token-reconnect",
+            groupPrefixHex: "46",
+            kind: "FUNGIBLE",
+          },
+        ],
+        syncTokenHistory: async (_db, _deps, _config, tokenId, mode) => {
+          assert.equal(tokenId, "token-reconnect");
+          modes.push(mode);
+          return {
+            tokenId,
+            pageCount: 1,
+            scannedTradeCount: 0,
+            insertedTradeCount: 0,
+          };
+        },
+      },
+    },
+  );
+
+  try {
+    await service.start();
+    assert.deepEqual(modes, ["full"]);
+
+    wsConfig?.onReconnect?.({});
+    wsConfig?.onConnect?.({});
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(modes, ["full", "tail"]);
+    assert.equal(service.getStatus().phase, "ready");
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
 test("service can defer known zero-trade tokens out of blocking bootstrap", async () => {
   const db = openDatabase(":memory:");
   db.upsertTrackedToken({

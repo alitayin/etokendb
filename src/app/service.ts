@@ -463,6 +463,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private phase: ServiceStatus["phase"] = "starting";
   private ready = false;
   private wsConnected = false;
+  private wsSubscriptionRefreshNeeded = false;
   private tipHeight: number | null = null;
   private bootstrapTokenCount = 0;
   private discoveryPageCount = 0;
@@ -1534,6 +1535,10 @@ export class AgoraTokenService implements ServiceReadApi {
       autoReconnect: true,
       onConnect: () => {
         this.wsConnected = true;
+        if (this.wsSubscriptionRefreshNeeded) {
+          this.enqueueReadyTokensForReconnectCatchUp();
+          this.wsSubscriptionRefreshNeeded = false;
+        }
         if (this.ready) {
           this.phase = "ready";
         }
@@ -1541,6 +1546,7 @@ export class AgoraTokenService implements ServiceReadApi {
       },
       onReconnect: () => {
         this.wsConnected = false;
+        this.wsSubscriptionRefreshNeeded = true;
         if (this.ready) {
           this.phase = "degraded";
         }
@@ -1548,6 +1554,7 @@ export class AgoraTokenService implements ServiceReadApi {
       },
       onEnd: () => {
         this.wsConnected = false;
+        this.wsSubscriptionRefreshNeeded = true;
         if (this.ready) {
           this.phase = "degraded";
         }
@@ -1555,6 +1562,7 @@ export class AgoraTokenService implements ServiceReadApi {
       },
       onError: () => {
         this.wsConnected = false;
+        this.wsSubscriptionRefreshNeeded = true;
         if (this.ready) {
           this.phase = "degraded";
         }
@@ -1614,6 +1622,21 @@ export class AgoraTokenService implements ServiceReadApi {
       state.dirty = true;
       this.db.markTokenWsEvent(tokenId, Date.now());
       this.enqueueToken(tokenId);
+    }
+  }
+
+  private enqueueReadyTokensForReconnectCatchUp(): void {
+    if (!this.ready) {
+      return;
+    }
+
+    for (const state of this.tokenStates.values()) {
+      if (!state.active || !state.ready) {
+        continue;
+      }
+
+      state.dirty = true;
+      this.enqueueToken(state.tokenId);
     }
   }
 
