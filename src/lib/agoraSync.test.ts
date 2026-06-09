@@ -285,6 +285,81 @@ test("syncTokenHistory inserts trades once and accumulates stats once", async ()
   }
 });
 
+test("syncTokenHistory searches nearby raw pages when normalized and raw history drift", async () => {
+  const tokenId = "token-drift";
+  const db = openDatabase(":memory:");
+
+  try {
+    const deps = makeDeps([
+      {
+        rawTxs: [],
+        offers: [
+          makeTakenOffer({
+            offerTxid: "offer-2",
+            tokenId,
+            paidSats: 200n,
+            soldAtoms: 20n,
+          }),
+        ],
+      },
+      {
+        rawTxs: [
+          makeRawSpendTx({
+            spendTxid: "spend-2",
+            offerTxid: "offer-2",
+            blockHeight: 102,
+            blockTimestamp: 1002,
+          }),
+        ],
+        offers: [],
+      },
+    ]);
+
+    const result = await syncTokenHistory(db, deps, BASE_CONFIG, tokenId, "tail");
+    assert.equal(result.insertedTradeCount, 1);
+
+    assert.deepEqual(db.getTokenStats(tokenId), {
+      tokenId,
+      tradeCount: 1,
+      cumulativePaidSats: "200",
+      lastTradeOfferTxid: "offer-2",
+      lastTradeOfferOutIdx: 2,
+      lastTradeBlockHeight: 102,
+      lastTradeBlockTimestamp: 1002,
+      lastTradePriceNanosatsPerAtom: "10000000000",
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("syncTokenHistory skips offers with missing raw context", async () => {
+  const tokenId = "token-missing-context";
+  const db = openDatabase(":memory:");
+
+  try {
+    const deps = makeDeps([
+      {
+        rawTxs: [],
+        offers: [
+          makeTakenOffer({
+            offerTxid: "offer-missing",
+            tokenId,
+            paidSats: 200n,
+            soldAtoms: 20n,
+          }),
+        ],
+      },
+    ]);
+
+    const result = await syncTokenHistory(db, deps, BASE_CONFIG, tokenId, "tail");
+    assert.equal(result.insertedTradeCount, 0);
+    assert.equal(db.getTokenStats(tokenId), null);
+  } finally {
+    db.close();
+  }
+});
+
 test("tail sync scans multiple pages so new trades on page 1 are not missed", async () => {
   const tokenId = "token-2";
   const db = openDatabase(":memory:");

@@ -18,6 +18,7 @@ export const AGORA_PLUGIN_NAME = "agora";
 export const GROUP_PREFIX_ACTIVE_FUNGIBLE = "46";
 export const GROUP_PREFIX_ACTIVE_GROUP = "47";
 export const GROUP_PREFIX_TOKEN_ID = "54";
+const RAW_CONTEXT_FALLBACK_PAGE_COUNT = 5;
 
 interface RawOfferSpendContext {
   spendTxid: string;
@@ -388,26 +389,86 @@ export async function syncTokenHistory(
 ): Promise<TokenSyncResult> {
   const plugin = deps.chronik.plugin(AGORA_PLUGIN_NAME);
   const insertedTrades: ProcessedTradeRecord[] = [];
+  const rawContextCache = new Map<string, Map<number, Map<string, RawOfferSpendContext>>>();
+  const rawNumPagesByGroup = new Map<string, number>();
   let page = 0;
   let pageCount = 0;
   let numPages = 1;
   let scannedTradeCount = 0;
   const maxPages = mode === "tail" ? config.tailPageCount : Number.POSITIVE_INFINITY;
+  const primaryRawGroupHex = tokenIdGroupHex(tokenId);
+  const fallbackRawGroupHex = `${GROUP_PREFIX_ACTIVE_FUNGIBLE}${tokenId}`;
+
+  const loadRawContexts = async (
+    groupHex: string,
+    rawPage: number,
+  ): Promise<Map<string, RawOfferSpendContext>> => {
+    const pagesByGroup = rawContextCache.get(groupHex) ?? new Map();
+    const cached = pagesByGroup.get(rawPage);
+    if (cached) {
+      return cached;
+    }
+
+    const label = `Chronik raw history ${tokenId} group ${groupHex.slice(0, 2)} page ${rawPage}`;
+    const rawHistory = await retryAsync(
+      () =>
+        withTimeout(
+          plugin.history(groupHex, rawPage, config.historyPageSize),
+          config.requestTimeoutMs,
+          label,
+        ),
+      config.requestRetryCount,
+      label,
+    );
+    const contexts = mapRawOfferSpends(rawHistory.txs);
+    pagesByGroup.set(rawPage, contexts);
+    rawContextCache.set(groupHex, pagesByGroup);
+    rawNumPagesByGroup.set(groupHex, rawHistory.numPages);
+    return contexts;
+  };
+
+  const findRawContext = async (
+    key: string,
+    currentPage: number,
+  ): Promise<RawOfferSpendContext | undefined> => {
+    const currentContexts = await loadRawContexts(primaryRawGroupHex, currentPage);
+    const current = currentContexts.get(key);
+    if (current) {
+      return current;
+    }
+
+    const minFallbackPage = Math.max(
+      0,
+      currentPage - RAW_CONTEXT_FALLBACK_PAGE_COUNT,
+    );
+    const maxFallbackPage = currentPage + RAW_CONTEXT_FALLBACK_PAGE_COUNT;
+    for (const groupHex of [primaryRawGroupHex, fallbackRawGroupHex]) {
+      for (let rawPage = minFallbackPage; rawPage <= maxFallbackPage; rawPage += 1) {
+        const groupNumPages = rawNumPagesByGroup.get(groupHex);
+        if (groupNumPages !== undefined && rawPage >= groupNumPages) {
+          break;
+        }
+
+        let contexts: Map<string, RawOfferSpendContext>;
+        try {
+          contexts = await loadRawContexts(groupHex, rawPage);
+        } catch {
+          continue;
+        }
+        const context = contexts.get(key);
+        if (context) {
+          return context;
+        }
+      }
+    }
+
+    return undefined;
+  };
 
   while (page < numPages && page < maxPages) {
-    const rawHistoryLabel = `Chronik raw history ${tokenId} page ${page}`;
     const normalizedHistoryLabel = `Agora normalized history ${tokenId} page ${page}`;
-    const [rawHistory, normalizedHistory] = await Promise.all([
-      retryAsync(
-        () =>
-          withTimeout(
-            plugin.history(tokenIdGroupHex(tokenId), page, config.historyPageSize),
-            config.requestTimeoutMs,
-            rawHistoryLabel,
-          ),
-        config.requestRetryCount,
-        rawHistoryLabel,
-      ),
+    const [rawContexts, normalizedHistory] = await Promise.all([
+      loadRawContexts(primaryRawGroupHex, page),
       retryAsync(
         () =>
           withTimeout(
@@ -427,20 +488,13 @@ export async function syncTokenHistory(
     ]);
 
     numPages = normalizedHistory.numPages;
-    const rawContexts = mapRawOfferSpends(rawHistory.txs);
 
     const pageTrades: ProcessedTradeRecord[] = [];
     for (const offer of normalizedHistory.offers) {
-      const context = rawContexts.get(
-        offerKey(offer.outpoint.txid, offer.outpoint.outIdx),
-      );
+      const key = offerKey(offer.outpoint.txid, offer.outpoint.outIdx);
+      const context = rawContexts.get(key) ?? await findRawContext(key, page);
       if (!context) {
-        throw new Error(
-          `Missing raw context for ${tokenId} offer ${offerKey(
-            offer.outpoint.txid,
-            offer.outpoint.outIdx,
-          )}`,
-        );
+        continue;
       }
 
       const trade = normalizeTakenOffer(offer, context);

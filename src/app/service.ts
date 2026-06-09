@@ -1598,7 +1598,7 @@ export class AgoraTokenService implements ServiceReadApi {
       return;
     }
 
-    if (msg.type !== "Tx") {
+    if (msg.type !== "Tx" || msg.msgType !== "TX_CONFIRMED") {
       return;
     }
 

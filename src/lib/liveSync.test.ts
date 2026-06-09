@@ -155,6 +155,7 @@ test("live sync only marks subscribed fungible token ids dirty", async () => {
 
     await live.handleWsMessage({
       type: "Tx",
+      msgType: "TX_CONFIRMED",
       txid: "spend-1",
     } as never);
 

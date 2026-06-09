@@ -398,6 +398,7 @@ test("service performs tail catch-up before marking bootstrap token ready", asyn
     await (service as unknown as { handleWsMessage: (msg: unknown) => Promise<void> })
       .handleWsMessage({
         type: "Tx",
+        msgType: "TX_CONFIRMED",
         txid: "spend-1",
       });
 
@@ -1595,6 +1596,7 @@ test("service can defer known zero-trade tokens out of blocking bootstrap", asyn
     await (service as unknown as { handleWsMessage: (msg: unknown) => Promise<void> })
       .handleWsMessage({
         type: "Tx",
+        msgType: "TX_CONFIRMED",
         txid: "spend-zero",
       });
     await new Promise((resolve) => setImmediate(resolve));

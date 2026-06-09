@@ -133,7 +133,7 @@ export class AgoraLiveSyncService {
   }
 
   async handleWsMessage(msg: WsMsgClient): Promise<void> {
-    if (msg.type !== "Tx") {
+    if (msg.type !== "Tx" || msg.msgType !== "TX_CONFIRMED") {
       return;
     }
 
