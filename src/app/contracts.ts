@@ -64,8 +64,13 @@ export interface ServiceStatus {
   bootstrapTokenCount: number;
   bootstrapReadyCount: number;
   discoveryPageCount: number;
+  chainCursorHeight: number | null;
+  chainLagBlocks: number | null;
+  pendingTokenCount: number;
+  wsReconnectAttempts: number;
   lastDiscoveryAt: string | null;
   lastTipUpdateAt: string | null;
+  lastCatchUpAt: string | null;
   lastError: string | null;
 }
 

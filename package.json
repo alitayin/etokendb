@@ -15,6 +15,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test src/**/*.test.ts",
+    "backup": "tsx src/cli/backup.ts",
     "probe:agora": "tsx src/probes/agoraProbe.ts",
     "probe:agora-page": "tsx src/probes/agoraPageProbe.ts",
     "sync:discover-active": "tsx src/cli/agoraSync.ts discover-active",

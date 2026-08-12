@@ -84,6 +84,34 @@ test("tracked token lifecycle fields support bootstrap/init/ready progress", () 
   }
 });
 
+test("chain sync cursor is created, updated, and persisted", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "etokendb-cursor-"));
+  const sqlitePath = path.join(tempDir, "cursor.sqlite");
+  let db = openDatabase(sqlitePath);
+
+  try {
+    assert.equal(db.getChainSyncCursor(), null);
+    db.setChainSyncCursor(900_000, "block-900000", 1_000);
+    assert.deepEqual(db.getChainSyncCursor(), {
+      blockHeight: 900_000,
+      blockHash: "block-900000",
+      updatedAt: 1_000,
+    });
+
+    db.setChainSyncCursor(900_001, "block-900001", 2_000);
+    db.close();
+    db = openDatabase(sqlitePath);
+    assert.deepEqual(db.getChainSyncCursor(), {
+      blockHeight: 900_001,
+      blockHash: "block-900001",
+      updatedAt: 2_000,
+    });
+  } finally {
+    db.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("insertProcessedTrades dedupes and updates token_block_stats incrementally", () => {
   const db = openDatabase(":memory:");
 
@@ -892,6 +920,7 @@ test("openDatabase migrates legacy token_stats rows to include 30 day rolling co
             AND name IN (
               'api_route_access_totals',
               'api_route_access_hourly',
+              'chain_sync_state',
               'token_visit_totals',
               'token_visit_hourly'
             )
@@ -902,9 +931,11 @@ test("openDatabase migrates legacy token_stats rows to include 30 day rolling co
     assert.deepEqual(tables.map((table) => table.name), [
       "api_route_access_hourly",
       "api_route_access_totals",
+      "chain_sync_state",
       "token_visit_hourly",
       "token_visit_totals",
     ]);
+    assert.equal(db.getChainSyncCursor(), null);
   } finally {
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });

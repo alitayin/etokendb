@@ -10,6 +10,7 @@ import type { AppDatabase } from "./db.js";
 import type {
   ActiveTokenSeed,
   ProcessedTradeRecord,
+  TokenSyncMode,
   TokenStatsRecord,
   TokenSyncResult,
 } from "./types.js";
@@ -32,7 +33,8 @@ export interface SyncDependencies {
   chronik: Pick<
     ChronikClient,
     "plugin" | "tx" | "ws" | "blockchainInfo" | "token"
-  >;
+  > &
+    Partial<Pick<ChronikClient, "block" | "blockTxs">>;
   agora: Pick<
     Agora,
     | "historicOffers"
@@ -400,8 +402,9 @@ export async function syncTokenHistory(
   deps: SyncDependencies,
   config: AppConfig,
   tokenId: string,
-  mode: "full" | "tail",
+  mode: TokenSyncMode,
   progress?: SyncProgressHandlers,
+  catchUpAfterBlockHeight?: number,
 ): Promise<TokenSyncResult> {
   const plugin = deps.chronik.plugin(AGORA_PLUGIN_NAME);
   const insertedTrades: ProcessedTradeRecord[] = [];
@@ -506,11 +509,15 @@ export async function syncTokenHistory(
     numPages = normalizedHistory.numPages;
 
     const pageTrades: ProcessedTradeRecord[] = [];
+    const normalizedContextHeights: number[] = [];
     for (const offer of normalizedHistory.offers) {
       const key = offerKey(offer.outpoint.txid, offer.outpoint.outIdx);
       const context = rawContexts.get(key) ?? await findRawContext(key, page);
       if (!context) {
         continue;
+      }
+      if (context.blockHeight !== null) {
+        normalizedContextHeights.push(context.blockHeight);
       }
 
       const trade = normalizeTakenOffer(offer, context);
@@ -533,6 +540,17 @@ export async function syncTokenHistory(
     });
     page += 1;
     pageCount += 1;
+
+    if (mode === "catchup" && catchUpAfterBlockHeight !== undefined) {
+      const reachedCheckpoint =
+        normalizedContextHeights.length > 0 &&
+        normalizedContextHeights.every(
+          (height) => height <= catchUpAfterBlockHeight,
+        );
+      if (reachedCheckpoint) {
+        break;
+      }
+    }
   }
 
   if (insertedTrades.length > 0) {
@@ -555,7 +573,7 @@ export async function syncTrackedTokens(
   deps: SyncDependencies,
   config: AppConfig,
   tokenIds: string[],
-  mode: "full" | "tail",
+  mode: TokenSyncMode,
   progress?: SyncProgressHandlers,
 ): Promise<TokenSyncResult[]> {
   const results: TokenSyncResult[] = [];
@@ -580,7 +598,7 @@ export async function syncActiveTokens(
   db: AppDatabase,
   deps: SyncDependencies,
   config: AppConfig,
-  mode: "full" | "tail",
+  mode: TokenSyncMode,
   progress?: SyncProgressHandlers,
 ): Promise<{
   discovered: number;

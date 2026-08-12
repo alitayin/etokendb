@@ -104,8 +104,13 @@ function sampleStatus(): ServiceStatus {
     bootstrapTokenCount: 10,
     bootstrapReadyCount: 5,
     discoveryPageCount: 70,
+    chainCursorHeight: 122,
+    chainLagBlocks: 1,
+    pendingTokenCount: 0,
+    wsReconnectAttempts: 0,
     lastDiscoveryAt: "2026-04-15T00:10:00.000Z",
     lastTipUpdateAt: "2026-04-15T00:10:05.000Z",
+    lastCatchUpAt: "2026-04-15T00:10:06.000Z",
     lastError: null,
   };
 }

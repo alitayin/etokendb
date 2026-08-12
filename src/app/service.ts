@@ -50,7 +50,7 @@ import {
   type ProjectInfoInvoiceRecord,
   type TokenProjectInfoRecord,
 } from "../lib/projectInfo.js";
-import type { ActiveTokenSeed } from "../lib/types.js";
+import type { ActiveTokenSeed, TokenSyncMode } from "../lib/types.js";
 import type {
   AnalyticsSummary,
   CreateProjectInfoInvoiceInput,
@@ -85,6 +85,10 @@ type Logger = Pick<Console, "info" | "warn" | "error">;
 const CANDLE_TIMEZONE = "Asia/Shanghai";
 const WS_TX_DEDUP_TTL_MS = 5 * 60 * 1000;
 const WS_TX_DEDUP_MAX_ENTRIES = 2_000;
+const WS_RECONNECT_BASE_DELAY_MS = 1_000;
+const WS_RECONNECT_MAX_DELAY_MS = 60_000;
+const BLOCK_TX_PAGE_SIZE = 199;
+const INITIAL_CURSOR_REWIND_BLOCKS = 12;
 
 type TokenPhase = "pending" | "initializing" | "catching-up" | "ready" | "error";
 
@@ -95,6 +99,8 @@ interface TokenRuntimeState {
   bootstrapCohort: boolean;
   dirty: boolean;
   processing: boolean;
+  retryAttempts: number;
+  retryTimer: NodeJS.Timeout | null;
   phase: TokenPhase;
   lastError: string | null;
 }
@@ -133,6 +139,7 @@ export interface AgoraTokenServiceOptions {
   reviewIdFactory?: () => string;
   reviewVerifierSatsFactory?: () => number;
   projectInfoInvoiceIdFactory?: () => string;
+  retryDelayMsFactory?: (attempt: number) => number;
 }
 
 function toIso(timestampMs: number | null): string | null {
@@ -467,7 +474,9 @@ export class AgoraTokenService implements ServiceReadApi {
   private readonly pendingQueue: string[] = [];
   private readonly bootstrapResolvers = new Set<() => void>();
   private readonly bootstrapRejectors = new Set<(error: Error) => void>();
+  private readonly tokenSyncLocks = new Map<string, Promise<void>>();
   private ws: WsEndpoint | null = null;
+  private wsReconnectTimer: NodeJS.Timeout | null = null;
   private discoveryTimer: NodeJS.Timeout | null = null;
   private tipRefreshTimer: NodeJS.Timeout | null = null;
   private pollingTailTimer: NodeJS.Timeout | null = null;
@@ -479,13 +488,21 @@ export class AgoraTokenService implements ServiceReadApi {
   private phase: ServiceStatus["phase"] = "starting";
   private ready = false;
   private wsConnected = false;
-  private wsSubscriptionRefreshNeeded = false;
+  private stopped = false;
+  private wsGeneration = 0;
+  private wsReconnectAttempts = 0;
   private discoveryInProgress = false;
+  private blockCatchUpInProgress = false;
+  private blockCatchUpPromise: Promise<void> | null = null;
+  private blockCatchUpRequested = false;
+  private blockCatchUpInitializeRequested = false;
   private tipHeight: number | null = null;
+  private tipHash: string | null = null;
   private bootstrapTokenCount = 0;
   private discoveryPageCount = 0;
   private lastDiscoveryAtMs: number | null = null;
   private lastTipUpdateAtMs: number | null = null;
+  private lastCatchUpAtMs: number | null = null;
   private lastError: string | null = null;
   private bootstrapError: Error | null = null;
   private readonly deferKnownTradeCountLte: number | null;
@@ -494,6 +511,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private readonly reviewIdFactory: () => string;
   private readonly reviewVerifierSatsFactory: () => number;
   private readonly projectInfoInvoiceIdFactory: () => string;
+  private readonly retryDelayMsFactory: (attempt: number) => number;
 
   constructor(
     private readonly db: AppDatabase,
@@ -521,11 +539,21 @@ export class AgoraTokenService implements ServiceReadApi {
         ));
     this.projectInfoInvoiceIdFactory =
       options?.projectInfoInvoiceIdFactory ?? randomUUID;
+    this.retryDelayMsFactory =
+      options?.retryDelayMsFactory ??
+      ((attempt) => {
+        const ceiling = Math.min(
+          WS_RECONNECT_MAX_DELAY_MS,
+          WS_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 10),
+        );
+        return Math.floor(ceiling / 2 + Math.random() * (ceiling / 2));
+      });
   }
 
   async start(): Promise<void> {
     this.startedAt = Date.now();
     this.ready = false;
+    this.stopped = false;
     this.phase = "starting";
     this.bootstrapError = null;
 
@@ -534,9 +562,7 @@ export class AgoraTokenService implements ServiceReadApi {
       await this.refreshTipHeight();
       await this.startWs();
       await this.bootstrap();
-      if (!this.wsConnected) {
-        await this.runBootstrapTailSweepWithoutWs();
-      }
+      await this.catchUpBlocks(true);
       this.ready = true;
       this.phase = this.wsConnected ? "ready" : "degraded";
       this.startBackgroundLoops();
@@ -547,6 +573,7 @@ export class AgoraTokenService implements ServiceReadApi {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.discoveryTimer) {
       clearInterval(this.discoveryTimer);
       this.discoveryTimer = null;
@@ -571,6 +598,16 @@ export class AgoraTokenService implements ServiceReadApi {
       clearInterval(this.projectInfoRetryTimer);
       this.projectInfoRetryTimer = null;
     }
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    for (const state of this.tokenStates.values()) {
+      if (state.retryTimer) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+      }
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -580,11 +617,26 @@ export class AgoraTokenService implements ServiceReadApi {
   }
 
   isReady(): boolean {
-    return this.ready;
+    if (!this.ready || this.phase === "error") {
+      return false;
+    }
+
+    const now = this.nowMs();
+    return (
+      this.lastTipUpdateAtMs !== null &&
+      now - this.lastTipUpdateAtMs <= this.config.readinessMaxTipAgeMs &&
+      this.lastCatchUpAtMs !== null &&
+      now - this.lastCatchUpAtMs <= this.config.readinessMaxTipAgeMs
+    );
+  }
+
+  isHealthy(): boolean {
+    return this.phase !== "error";
   }
 
   getStatus(): ServiceStatus {
     const trackedTokens = this.db.listTrackedTokens();
+    const chainCursor = this.db.getChainSyncCursor();
     const todayStartMs = startOfTodayMs();
     const now = new Date();
     const tradedTokenCount = this.db.sqlite
@@ -598,7 +650,7 @@ export class AgoraTokenService implements ServiceReadApi {
       .get() as { count: number };
 
     return {
-      ready: this.ready,
+      ready: this.isReady(),
       phase: this.phase,
       wsConnected: this.wsConnected,
       chronikUrl: this.config.chronikUrl,
@@ -622,8 +674,16 @@ export class AgoraTokenService implements ServiceReadApi {
       bootstrapTokenCount: this.db.countBootstrapTokens(),
       bootstrapReadyCount: this.db.countReadyBootstrapTokens(),
       discoveryPageCount: this.discoveryPageCount,
+      chainCursorHeight: chainCursor?.blockHeight ?? null,
+      chainLagBlocks:
+        this.tipHeight === null || chainCursor === null
+          ? null
+          : Math.max(0, this.tipHeight - chainCursor.blockHeight),
+      pendingTokenCount: this.pendingQueue.length + this.workerCount,
+      wsReconnectAttempts: this.wsReconnectAttempts,
       lastDiscoveryAt: toIso(this.lastDiscoveryAtMs),
       lastTipUpdateAt: toIso(this.lastTipUpdateAtMs),
+      lastCatchUpAt: toIso(this.lastCatchUpAtMs),
       lastError: this.lastError,
     };
   }
@@ -1489,22 +1549,17 @@ export class AgoraTokenService implements ServiceReadApi {
     }, this.config.discoveryIntervalMs);
 
     this.tipRefreshTimer = setInterval(() => {
-      void this.refreshTipHeight().catch((error) => {
-        this.setError(`tip refresh failed: ${this.formatError(error)}`);
-      });
+      void this.refreshTipHeight()
+        .then(() => this.catchUpBlocks())
+        .catch((error) => {
+          this.setError(`tip refresh failed: ${this.formatError(error)}`);
+        });
     }, this.config.tipRefreshIntervalMs);
 
     this.pollingTailTimer = setInterval(() => {
-      if (this.wsConnected) {
-        return;
-      }
-
-      for (const state of this.tokenStates.values()) {
-        if (state.active && state.ready) {
-          state.dirty = true;
-          this.enqueueToken(state.tokenId);
-        }
-      }
+      void this.catchUpBlocks().catch((error) => {
+        this.setError(`block catch-up failed: ${this.formatError(error)}`);
+      });
     }, this.config.pollIntervalMs);
 
     this.analyticsPruneTimer = setInterval(() => {
@@ -1548,72 +1603,117 @@ export class AgoraTokenService implements ServiceReadApi {
   }
 
   private async startWs(): Promise<void> {
+    const generation = ++this.wsGeneration;
     this.wsConnected = false;
-    this.ws = this.deps.chronik.ws({
-      autoReconnect: true,
+    this.subscribedTokenIds.clear();
+    const endpoint = this.deps.chronik.ws({
+      autoReconnect: false,
       onConnect: () => {
-        this.wsConnected = true;
-        if (this.wsSubscriptionRefreshNeeded) {
-          this.enqueueReadyTokensForReconnectCatchUp();
-          this.wsSubscriptionRefreshNeeded = false;
+        if (this.stopped || generation !== this.wsGeneration) {
+          return;
         }
+        this.wsConnected = true;
+        this.wsReconnectAttempts = 0;
         if (this.ready) {
           this.phase = "ready";
         }
         this.logger.info("ws connected");
       },
-      onReconnect: () => {
-        this.wsConnected = false;
-        this.wsSubscriptionRefreshNeeded = true;
-        if (this.ready) {
-          this.phase = "degraded";
-        }
-        this.logger.warn("ws reconnecting");
-      },
       onEnd: () => {
-        this.wsConnected = false;
-        this.wsSubscriptionRefreshNeeded = true;
-        if (this.ready) {
-          this.phase = "degraded";
-        }
-        this.logger.warn("ws ended");
-      },
-      onError: () => {
-        this.wsConnected = false;
-        this.wsSubscriptionRefreshNeeded = true;
-        if (this.ready) {
-          this.phase = "degraded";
-        }
+        this.handleWsDisconnect(generation, "ended");
       },
       onMessage: (msg) => {
+        if (this.stopped || generation !== this.wsGeneration) {
+          return;
+        }
         void this.handleWsMessage(msg).catch((error) => {
           this.setError(`ws message handling failed: ${this.formatError(error)}`);
         });
       },
     });
-    this.ws.subscribeToBlocks();
-    this.ws.subscribeToLokadId?.(AGORA_LOKAD_ID_HEX);
+    // chronik-client 4.1.0 does not copy config.onError onto the endpoint, but
+    // its transport closes an errored socket when this property is present.
+    endpoint.onError = () => {};
+    this.ws = endpoint;
+    endpoint.subscribeToBlocks();
+    endpoint.subscribeToLokadId?.(AGORA_LOKAD_ID_HEX);
 
     try {
       await withTimeout(
-        this.ws.waitForOpen(),
+        endpoint.waitForOpen(),
         this.config.wsConnectTimeoutMs,
         "Chronik websocket connection",
       );
+      if (endpoint.ws?.readyState !== 1) {
+        throw new Error("Chronik websocket did not reach OPEN state");
+      }
+      if (this.stopped || generation !== this.wsGeneration) {
+        endpoint.close();
+        return;
+      }
       this.wsConnected = true;
+      if (this.ready) {
+        this.phase = "ready";
+      }
+      this.subscribeTrackedTokens(
+        [...this.tokenStates.values()]
+          .filter((state) => state.active)
+          .map((state) => state.tokenId),
+      );
+      if (this.ready) {
+        void this.catchUpBlocks().catch((error) => {
+          this.setError(`post-connect catch-up failed: ${this.formatError(error)}`);
+        });
+      }
     } catch (error) {
-      this.ws.close();
-      this.ws = null;
+      if (generation !== this.wsGeneration || this.stopped) {
+        return;
+      }
+      endpoint.close();
+      if (this.ws === endpoint) {
+        this.ws = null;
+      }
       this.wsConnected = false;
       this.logger.warn(
         `ws unavailable, falling back to polling: ${this.formatError(error)}`,
       );
+      this.scheduleWsReconnect();
     }
+  }
+
+  private handleWsDisconnect(generation: number, reason: string): void {
+    if (this.stopped || generation !== this.wsGeneration) {
+      return;
+    }
+    this.wsConnected = false;
+    this.ws = null;
+    this.subscribedTokenIds.clear();
+    if (this.ready) {
+      this.phase = "degraded";
+    }
+    this.logger.warn(`ws ${reason}; scheduling reconnect`);
+    this.scheduleWsReconnect();
+  }
+
+  private scheduleWsReconnect(): void {
+    if (this.stopped || this.wsReconnectTimer) {
+      return;
+    }
+    const attempt = this.wsReconnectAttempts + 1;
+    this.wsReconnectAttempts = attempt;
+    this.wsReconnectTimer = setTimeout(() => {
+      this.wsReconnectTimer = null;
+      void this.startWs().catch((error) => {
+        this.logger.warn(`ws reconnect failed: ${this.formatError(error)}`);
+        this.scheduleWsReconnect();
+      });
+    }, this.retryDelayMsFactory(attempt));
   }
 
   private async handleWsMessage(msg: WsMsgClient): Promise<void> {
     if (msg.type === "Block") {
       await this.refreshTipHeight();
+      await this.catchUpBlocks();
       return;
     }
 
@@ -1665,21 +1765,6 @@ export class AgoraTokenService implements ServiceReadApi {
       throw error;
     } finally {
       this.pruneRecentWsTxids(nowMs);
-    }
-  }
-
-  private enqueueReadyTokensForReconnectCatchUp(): void {
-    if (!this.ready) {
-      return;
-    }
-
-    for (const state of this.tokenStates.values()) {
-      if (!state.active || !state.ready) {
-        continue;
-      }
-
-      state.dirty = true;
-      this.enqueueToken(state.tokenId);
     }
   }
 
@@ -1890,6 +1975,8 @@ export class AgoraTokenService implements ServiceReadApi {
         bootstrapCohort: false,
         dirty: false,
         processing: false,
+        retryAttempts: 0,
+        retryTimer: null,
         phase: "pending",
         lastError: null,
       };
@@ -1934,13 +2021,13 @@ export class AgoraTokenService implements ServiceReadApi {
       if (!state.ready) {
         state.phase = "initializing";
         this.db.markTokenInitStarted(tokenId, Date.now());
-        await this.runTokenSync(tokenId, "full");
+        await this.runTokenSyncLocked(tokenId, "full");
       }
 
       while (state.dirty) {
         state.dirty = false;
         state.phase = "catching-up";
-        await this.runTokenSync(tokenId, "tail");
+        await this.runTokenSyncLocked(tokenId, "tail");
       }
 
       if (!state.ready) {
@@ -1948,47 +2035,94 @@ export class AgoraTokenService implements ServiceReadApi {
       }
 
       state.phase = "ready";
+      state.retryAttempts = 0;
       this.db.markTokenInitCompleted(tokenId, Date.now());
       this.db.markTokenReady(tokenId, true, Date.now());
     } catch (error) {
       state.phase = "error";
       state.lastError = this.formatError(error);
-      this.db.markTokenInitFailed(tokenId, Date.now(), state.lastError);
       this.setError(`token ${tokenId} sync failed: ${state.lastError}`);
-      if (!this.ready && state.bootstrapCohort) {
+      if (!state.ready) {
+        this.db.markTokenInitFailed(tokenId, Date.now(), state.lastError);
+      }
+      if (!this.ready && state.bootstrapCohort && !state.ready) {
         this.rejectBootstrapWaiters(
           new Error(`Bootstrap failed for ${tokenId}: ${state.lastError}`),
         );
+      } else if (state.ready) {
+        state.dirty = true;
+        this.scheduleTokenRetry(state);
       }
     } finally {
       state.processing = false;
-      if (state.dirty && !this.queuedTokenIds.has(tokenId)) {
+      if (state.dirty && !state.retryTimer && !this.queuedTokenIds.has(tokenId)) {
         this.enqueueToken(tokenId);
       }
     }
   }
 
+  private scheduleTokenRetry(state: TokenRuntimeState): void {
+    if (this.stopped || state.retryTimer) {
+      return;
+    }
+    state.retryAttempts += 1;
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
+      if (!this.stopped && state.dirty) {
+        this.enqueueToken(state.tokenId);
+      }
+    }, this.retryDelayMsFactory(state.retryAttempts));
+  }
+
   private async runTokenSync(
     tokenId: string,
-    mode: "full" | "tail",
+    mode: TokenSyncMode,
+    catchUpAfterBlockHeight?: number,
   ): Promise<void> {
     const progress: SyncProgressHandlers = {
       onTokenSyncPage: (entry) => {
-        this.logger.info(
-          `${mode} token=${entry.tokenId} page=${entry.page + 1}/${Math.max(entry.numPages, 1)} scanned=${entry.scannedTradeCount} inserted=${entry.insertedTradeCount}`,
-        );
+        if (mode === "full" || entry.insertedTradeCount > 0) {
+          this.logger.info(
+            `${mode} token=${entry.tokenId} page=${entry.page + 1}/${Math.max(entry.numPages, 1)} scanned=${entry.scannedTradeCount} inserted=${entry.insertedTradeCount}`,
+          );
+        }
       },
     };
-    await this.ops.syncTokenHistory(
+    const result = await this.ops.syncTokenHistory(
       this.db,
       this.deps,
       this.config,
       tokenId,
       mode,
       progress,
+      catchUpAfterBlockHeight,
     );
+    if (mode === "catchup" && result.insertedTradeCount > 0) {
+      this.logger.info(
+        `catchup token=${tokenId} pages=${result.pageCount} inserted=${result.insertedTradeCount}`,
+      );
+    }
     if (this.tipHeight !== null) {
       this.db.recomputeTokenAggregateStats(tokenId, this.tipHeight);
+    }
+  }
+
+  private async runTokenSyncLocked(
+    tokenId: string,
+    mode: TokenSyncMode,
+    catchUpAfterBlockHeight?: number,
+  ): Promise<void> {
+    const previous = this.tokenSyncLocks.get(tokenId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.runTokenSync(tokenId, mode, catchUpAfterBlockHeight));
+    this.tokenSyncLocks.set(tokenId, current);
+    try {
+      await current;
+    } finally {
+      if (this.tokenSyncLocks.get(tokenId) === current) {
+        this.tokenSyncLocks.delete(tokenId);
+      }
     }
   }
 
@@ -2005,40 +2139,245 @@ export class AgoraTokenService implements ServiceReadApi {
     );
     const changed = this.tipHeight !== info.tipHeight;
     this.tipHeight = info.tipHeight;
-    this.lastTipUpdateAtMs = Date.now();
+    this.tipHash = info.tipHash;
+    this.lastTipUpdateAtMs = this.nowMs();
     if (changed) {
       this.db.recomputeAllTokenAggregateStats(info.tipHeight);
     }
   }
 
-  private async runBootstrapTailSweepWithoutWs(): Promise<void> {
-    const tokenIds = [...this.tokenStates.values()]
-      .filter((state) => state.bootstrapCohort && state.active)
-      .map((state) => state.tokenId);
-    if (tokenIds.length === 0) {
+  private async catchUpBlocks(initializeIfMissing = false): Promise<void> {
+    if (this.blockCatchUpInProgress) {
+      this.blockCatchUpRequested = true;
+      this.blockCatchUpInitializeRequested ||= initializeIfMissing;
+      await this.blockCatchUpPromise;
       return;
     }
 
-    let baselineTipHeight = this.tipHeight;
-    for (let pass = 0; pass < 3; pass += 1) {
-      await this.refreshTipHeight();
-      if (this.tipHeight === null) {
-        return;
+    this.blockCatchUpInProgress = true;
+    const catchUpPromise = (async () => {
+      let shouldInitialize = initializeIfMissing;
+      do {
+        this.blockCatchUpRequested = false;
+        shouldInitialize ||= this.blockCatchUpInitializeRequested;
+        this.blockCatchUpInitializeRequested = false;
+        await this.runBlockCatchUp(shouldInitialize);
+        shouldInitialize = false;
+      } while (this.blockCatchUpRequested && !this.stopped);
+    })();
+    this.blockCatchUpPromise = catchUpPromise;
+    try {
+      await catchUpPromise;
+    } finally {
+      if (this.blockCatchUpPromise === catchUpPromise) {
+        this.blockCatchUpPromise = null;
+        this.blockCatchUpInProgress = false;
       }
-      if (baselineTipHeight !== null && this.tipHeight <= baselineTipHeight) {
+    }
+  }
+
+  private async runBlockCatchUp(initializeIfMissing: boolean): Promise<void> {
+    if (this.tipHeight === null || this.tipHash === null) {
+      return;
+    }
+
+    const target = await this.getFinalizedCatchUpTarget();
+    let cursor = this.db.getChainSyncCursor();
+    if (!cursor) {
+      if (!initializeIfMissing) {
         return;
       }
 
-      this.logger.info(
-        `polling bootstrap catch-up pass=${pass + 1} tip=${this.tipHeight} tokens=${tokenIds.length}`,
-      );
-      for (const tokenId of tokenIds) {
-        const state = this.ensureTokenState(tokenId);
-        state.phase = "catching-up";
-        await this.runTokenSync(tokenId, "tail");
+      if (!this.deps.chronik.block || !this.deps.chronik.blockTxs) {
+        const updatedAt = this.nowMs();
+        this.db.setChainSyncCursor(target.height, target.hash, updatedAt);
+        this.lastCatchUpAtMs = updatedAt;
+        this.logger.warn(
+          `initialized chain cursor without rewind height=${target.height}; Chronik block APIs unavailable`,
+        );
+        return;
       }
-      baselineTipHeight = this.tipHeight;
+
+      const initialHeight = Math.max(
+        0,
+        target.height - INITIAL_CURSOR_REWIND_BLOCKS,
+      );
+      const initialBlock = await this.requestChronik(
+        () => this.getBlockAtHeight(initialHeight),
+        `Chronik initial cursor block ${initialHeight}`,
+      );
+      const updatedAt = this.nowMs();
+      this.db.setChainSyncCursor(initialHeight, initialBlock.blockInfo.hash, updatedAt);
+      cursor = {
+        blockHeight: initialHeight,
+        blockHash: initialBlock.blockInfo.hash,
+        updatedAt,
+      };
+      this.logger.info(
+        `initialized chain cursor height=${initialHeight} rewind_blocks=${target.height - initialHeight}`,
+      );
     }
+
+    if (cursor.blockHeight > target.height) {
+      throw new Error(
+        `chain cursor ${cursor.blockHeight} is ahead of finalized tip ${target.height}`,
+      );
+    }
+
+    if (this.deps.chronik.block) {
+      const cursorHeight = cursor.blockHeight;
+      const cursorBlock = await this.requestChronik(
+        () => this.getBlockAtHeight(cursorHeight),
+        `Chronik cursor block ${cursorHeight}`,
+      );
+      if (cursorBlock.blockInfo.hash !== cursor.blockHash) {
+        throw new Error(
+          `chain cursor hash mismatch at height ${cursorHeight}; manual reorg repair required`,
+        );
+      }
+    }
+
+    while (cursor.blockHeight < target.height && !this.stopped) {
+      const endHeight = Math.min(
+        target.height,
+        cursor.blockHeight + this.config.blockCatchUpBatchSize,
+      );
+      cursor = await this.processBlockRange(cursor.blockHeight, endHeight);
+    }
+    this.lastCatchUpAtMs = this.nowMs();
+  }
+
+  private async getFinalizedCatchUpTarget(): Promise<{
+    height: number;
+    hash: string;
+  }> {
+    if (
+      !this.deps.chronik.block ||
+      this.tipHeight === null ||
+      this.tipHash === null
+    ) {
+      return { height: this.tipHeight as number, hash: this.tipHash as string };
+    }
+
+    for (
+      let height = this.tipHeight;
+      height >= Math.max(0, this.tipHeight - 20);
+      height -= 1
+    ) {
+      const block = await this.requestChronik(
+        () => this.getBlockAtHeight(height),
+        `Chronik finalized block ${height}`,
+      );
+      if (block.blockInfo.isFinal) {
+        return { height, hash: block.blockInfo.hash };
+      }
+    }
+    throw new Error(`no finalized block found near tip ${this.tipHeight}`);
+  }
+
+  private getBlockAtHeight(
+    height: number,
+  ): ReturnType<NonNullable<SyncDependencies["chronik"]["block"]>> {
+    const block = this.deps.chronik.block;
+    if (!block) {
+      throw new Error("Chronik block method is unavailable");
+    }
+    return block(height);
+  }
+
+  private async processBlockRange(
+    afterHeight: number,
+    endHeight: number,
+  ): Promise<{ blockHeight: number; blockHash: string; updatedAt: number }> {
+    if (!this.deps.chronik.block || !this.deps.chronik.blockTxs) {
+      throw new Error("Chronik block catch-up methods are unavailable");
+    }
+
+    const affectedTokenIds = new Set<string>();
+    const fungibleTokenIds = new Set<string>();
+    let endHash = "";
+
+    for (let height = afterHeight + 1; height <= endHeight; height += 1) {
+      const block = await this.requestChronik(
+        () => this.getBlockAtHeight(height),
+        `Chronik block ${height}`,
+      );
+      endHash = block.blockInfo.hash;
+      let page = 0;
+      let numPages = 1;
+      while (page < numPages) {
+        const history = await this.requestChronik(
+          () =>
+            (this.deps.chronik.blockTxs as NonNullable<
+              typeof this.deps.chronik.blockTxs
+            >)(height, page, BLOCK_TX_PAGE_SIZE),
+          `Chronik block txs ${height} page ${page}`,
+        );
+        numPages = history.numPages;
+        for (const tx of history.txs) {
+          for (const tokenId of extractAgoraFungibleTokenIdsFromTx(tx)) {
+            fungibleTokenIds.add(tokenId);
+          }
+          for (const tokenId of this.ops.extractAgoraTokenIdsFromTx(tx)) {
+            affectedTokenIds.add(tokenId);
+          }
+        }
+        page += 1;
+      }
+    }
+
+    const syncTokenIds = [...affectedTokenIds].filter(
+      (tokenId) => fungibleTokenIds.has(tokenId) || this.db.getTrackedToken(tokenId),
+    );
+    for (const tokenId of syncTokenIds) {
+      const tracked = this.db.getTrackedToken(tokenId);
+      if (!tracked && !fungibleTokenIds.has(tokenId)) {
+        continue;
+      }
+      if (!tracked) {
+        this.activateFungibleTokenFromBlock(tokenId);
+      }
+      const state = this.ensureTokenState(tokenId);
+      state.phase = "catching-up";
+      await this.runTokenSyncLocked(
+        tokenId,
+        tracked?.isReady ? "catchup" : "full",
+        afterHeight,
+      );
+      state.ready = true;
+      state.phase = "ready";
+      this.db.markTokenInitCompleted(tokenId, this.nowMs());
+      this.db.markTokenReady(tokenId, true, this.nowMs());
+    }
+
+    const updatedAt = this.nowMs();
+    this.db.setChainSyncCursor(endHeight, endHash, updatedAt);
+    if (syncTokenIds.length > 0) {
+      this.logger.info(
+        `chain catch-up heights=${afterHeight + 1}-${endHeight} tokens=${syncTokenIds.length}`,
+      );
+    }
+    return { blockHeight: endHeight, blockHash: endHash, updatedAt };
+  }
+
+  private activateFungibleTokenFromBlock(tokenId: string): void {
+    this.db.upsertTrackedToken(toActiveFungibleSeed(tokenId));
+    const state = this.ensureTokenState(tokenId);
+    state.active = true;
+    state.ready = false;
+    this.db.markTokenInitPending(tokenId, this.nowMs());
+    this.subscribeTrackedTokens([tokenId]);
+  }
+
+  private requestChronik<T>(
+    operation: () => Promise<T>,
+    label: string,
+  ): Promise<T> {
+    return retryAsync(
+      () => withTimeout(operation(), this.config.requestTimeoutMs, label),
+      this.config.requestRetryCount,
+      label,
+    );
   }
 
   private queryTrades(query: TradeListQuery): PaginatedResult<TradeHistoryItem> {

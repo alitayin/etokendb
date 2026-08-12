@@ -31,6 +31,7 @@ npm install
 ```env
 CHRONIK_URL=https://chronik-native1.fabien.cash
 SQLITE_PATH=./data/etokendb.sqlite
+SERVER_HOST=127.0.0.1
 SERVER_PORT=8787
 
 BOOTSTRAP_CONCURRENCY=8
@@ -44,6 +45,11 @@ POLL_INTERVAL_MS=60000
 REQUEST_TIMEOUT_MS=20000
 REQUEST_RETRY_COUNT=3
 WS_CONNECT_TIMEOUT_MS=10000
+READINESS_MAX_TIP_AGE_MS=300000
+BLOCK_CATCHUP_BATCH_SIZE=100
+
+BACKUP_DIR=./backups
+BACKUP_RETENTION_COUNT=7
 
 # Required only for paid review invoice creation
 REVIEW_PAYMENT_ADDRESS=
@@ -102,9 +108,10 @@ To skip bootstrap history checks for every token already marked ready:
 npm run start:skip-ready
 ```
 
-This mode still initializes tokens that have never reached ready state. It also
-accepts that transactions missed while the service was offline are not repaired
-immediately at startup.
+This mode still initializes tokens that have never reached ready state. Known
+ready tokens are not individually scanned at startup. The persisted finalized
+block cursor replays only affected Agora token ids, including a 12-block rewind
+when the cursor is first created.
 
 ### Start under PM2
 
@@ -168,6 +175,7 @@ git pull
 npm install
 npm run check
 npm test
+npm run backup
 pm2 restart etokendb
 ```
 
@@ -175,14 +183,18 @@ Notes:
 
 - Keep `.env` and `SQLITE_PATH` stable.
 - The SQLite file is the source of truth. Restarting does not wipe synced data.
-- A restart still re-scans currently active tokens during bootstrap, but already-processed trades are deduped and not counted twice.
+- `start:skip-ready` avoids full history checks for known-ready tokens. The
+  finalized block cursor still repairs the shutdown window without walking the
+  full active-token set.
 
 ## 3. Runtime behavior
 
 - The service bootstraps first, then opens the API port.
 - During bootstrap, each active fungible token gets initialized.
 - If a token receives websocket activity while it is still initializing, it is marked dirty and gets a tail catch-up before it becomes ready.
-- If websocket is unavailable, the service falls back to polling mode and still completes bootstrap.
+- If websocket is unavailable, finalized-block catch-up continues by polling.
+- WebSocket endpoints are recreated by the application with exponential backoff
+  and subscriptions are rebuilt after every connection loss.
 - The WebSocket subscribes to the Agora `AGR0` LOKAD ID, so a fungible token is
   discovered immediately when its first offer is confirmed.
 - Every hour by default, the service performs a complete active-group
@@ -196,7 +208,7 @@ Notes:
   `--skip-known-zero-trade-bootstrap` is a convenience alias for `--defer-known-trade-count-lte=0`.
 - Fast restart mode:
   `--skip-known-ready-bootstrap` defers every previously-ready token out of
-  blocking bootstrap.
+  blocking bootstrap; block-based catch-up still runs before readiness.
 - General startup mode:
   `--defer-known-trade-count-lte=N` keeps previously-ready tokens with `tradeCount <= N` out of blocking bootstrap. They remain queryable from existing DB data, and only get tail-synced later when websocket or polling marks them dirty.
 
@@ -279,6 +291,45 @@ sudo certbot --nginx -d etokendb.alitayin.com
 After you proxy through nginx, you usually do not need public access to `8787` anymore.
 You can keep the app bound to `127.0.0.1:8787` behind nginx and close public firewall/security-group access to `8787`.
 
+The included site config uses dedicated `etokendb_api_per_ip` request and
+`etokendb_conn_per_ip` connection zones. They apply only where this site's
+`location` references them and do not change another virtual host's limits.
+
+## 4.2 Backups and log retention
+
+Create a WAL-safe online snapshot and retain the newest seven by default:
+
+```bash
+npm run backup
+```
+
+The command uses SQLite's online backup API, verifies `PRAGMA integrity_check`,
+and only then prunes old snapshots. Schedule it daily with cron:
+
+```cron
+15 3 * * * mkdir -p /root/etokendb/backups && cd /root/etokendb && /usr/bin/npm run backup >> /root/etokendb/backups/backup.log 2>&1
+```
+
+Local snapshots protect against database corruption and deployment mistakes,
+but not total VPS loss. Copy at least one snapshot off-host when storage
+credentials are available, and periodically open a restored snapshot.
+
+Rotate only this application's PM2 logs with a dedicated system rule. This
+does not change retention for other PM2 applications:
+
+```text
+/root/.pm2/logs/etokendb-out.log /root/.pm2/logs/etokendb-error.log {
+    daily
+    maxsize 50M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
 ## 5. Token ranking and descending order
 
 Yes. Token lists support both sorting and descending order.
@@ -356,13 +407,13 @@ If there are fewer than 2 confirmed trades in that 144-block window, it returns 
 
 These are review notes only. They do not change current business behavior.
 
-### A. Restart bootstrap still re-walks all currently active tokens
+### A. Restart bootstrap uses a persisted finalized-block cursor
 
-- This is safe because dedupe is handled by persisted `processed_trades`.
-- But startup cost still scales with the current active token set.
-- If the active set keeps growing, restart time will also keep growing.
-- Improvement direction:
-  store a stronger per-token checkpoint for bootstrap resumption, so already-fully-initialized active tokens can start in tail mode instead of always doing a fresh full walk.
+- `start:skip-ready` skips known-ready token history checks.
+- Startup validates the saved block hash and scans only blocks after the cursor.
+- The cursor advances only after every affected token sync succeeds.
+- The first cursor creation rewinds 12 finalized blocks to cover the deployment
+  window without scanning the complete active-token set.
 
 ### B. Discovery is still limited to currently active fungible Agora groups
 
@@ -371,12 +422,12 @@ These are review notes only. They do not change current business behavior.
 - Improvement direction:
   add a secondary discovery source or an offline historical sweep path if "all tokens that ever traded on Agora" becomes a strict requirement.
 
-### C. Polling fallback uses a fixed tail depth
+### C. Polling fallback uses finalized blocks
 
-- In degraded mode the service relies on tail polling and `TAIL_PAGE_COUNT`.
-- For a very high-volume token, more than `TAIL_PAGE_COUNT` new pages could appear between sweeps.
-- Improvement direction:
-  dynamically widen tail depth when recent token velocity is high, or drive catch-up by last seen block/tx anchors instead of a fixed page count.
+- In degraded mode the service scans blocks after the persistent cursor and
+  synchronizes only token ids affected by Agora transactions.
+- Per-token history paging continues until it reaches the prior block checkpoint,
+  so it does not depend on a fixed number of pages.
 
 ### D. Reorg repair is not implemented
 
@@ -422,5 +473,10 @@ These are review notes only. They do not change current business behavior.
 - `tradedTokenCount`
 - `discoveredTodayCount`
 - `activeDiscoveredTodayCount`
+- `chainCursorHeight`
+- `chainLagBlocks`
+- `pendingTokenCount`
+- `wsReconnectAttempts`
+- `lastCatchUpAt`
 
 `today` is calculated using the local machine timezone.

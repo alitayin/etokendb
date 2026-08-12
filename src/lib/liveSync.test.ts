@@ -10,6 +10,7 @@ const BASE_CONFIG: AppConfig = {
   chronikUrl: "https://example.invalid",
   sqlitePath: ":memory:",
   serverPort: 8787,
+  serverHost: "127.0.0.1",
   activeGroupPageSize: 50,
   historyPageSize: 50,
   tailPageCount: 2,
@@ -28,6 +29,8 @@ const BASE_CONFIG: AppConfig = {
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
+  readinessMaxTipAgeMs: 5 * 60_000,
+  blockCatchUpBatchSize: 100,
 };
 
 function makeTakenOffer(tokenId: string): unknown {

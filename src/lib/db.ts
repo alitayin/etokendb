@@ -33,6 +33,7 @@ import { computeRollingStatsSnapshot } from "./stats.js";
 import type {
   ActiveTokenSeed,
   CandleInterval,
+  ChainSyncCursor,
   ListTokenCandlesOptions,
   ListTokenStatsPageOptions,
   ListTradeHistoryOptions,
@@ -271,6 +272,12 @@ export interface AppDatabase {
     apiRouteBucketCount: number;
     tokenVisitBucketCount: number;
   };
+  getChainSyncCursor: () => ChainSyncCursor | null;
+  setChainSyncCursor: (
+    blockHeight: number,
+    blockHash: string,
+    updatedAt?: number,
+  ) => void;
 }
 
 const SHANGHAI_OFFSET_SECONDS = 8 * 60 * 60;
@@ -375,6 +382,13 @@ function createSchema(sqlite: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_token_block_stats_height
       ON token_block_stats (block_height);
+
+    CREATE TABLE IF NOT EXISTS chain_sync_state (
+      singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS token_stats (
       token_id TEXT PRIMARY KEY,
@@ -1156,6 +1170,25 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     UPDATE tracked_tokens
     SET last_ws_event_at = ?
     WHERE token_id = ?
+  `);
+
+  const getChainSyncCursorStmt = sqlite.prepare(`
+    SELECT block_height, block_hash, updated_at
+    FROM chain_sync_state
+    WHERE singleton_id = 1
+  `);
+
+  const setChainSyncCursorStmt = sqlite.prepare(`
+    INSERT INTO chain_sync_state (
+      singleton_id,
+      block_height,
+      block_hash,
+      updated_at
+    ) VALUES (1, ?, ?, ?)
+    ON CONFLICT(singleton_id) DO UPDATE SET
+      block_height = excluded.block_height,
+      block_hash = excluded.block_hash,
+      updated_at = excluded.updated_at
   `);
 
   const markTokenInitPendingStmt = sqlite.prepare(`
@@ -2786,6 +2819,21 @@ export function openDatabase(sqlitePath: string): AppDatabase {
     },
     markTokenWsEvent: (tokenId, eventAtMs) => {
       markTokenWsEventStmt.run(eventAtMs, tokenId);
+    },
+    getChainSyncCursor: () => {
+      const row = getChainSyncCursorStmt.get() as
+        | { block_height: number; block_hash: string; updated_at: number }
+        | undefined;
+      return row
+        ? {
+            blockHeight: row.block_height,
+            blockHash: row.block_hash,
+            updatedAt: row.updated_at,
+          }
+        : null;
+    },
+    setChainSyncCursor: (blockHeight, blockHash, updatedAt = Date.now()) => {
+      setChainSyncCursorStmt.run(blockHeight, blockHash, updatedAt);
     },
     insertProcessedTrades: (trades) => insertManyTradesTx(trades),
     getTokenStats: (tokenId) => {

@@ -164,8 +164,13 @@ Response `data` fields:
 - `bootstrapTokenCount`
 - `bootstrapReadyCount`
 - `discoveryPageCount`
+- `chainCursorHeight`: latest persisted finalized block processed by catch-up
+- `chainLagBlocks`: current tip minus the persisted finalized cursor
+- `pendingTokenCount`: queued and running token synchronizations
+- `wsReconnectAttempts`: current application-managed reconnect attempt count
 - `lastDiscoveryAt`
 - `lastTipUpdateAt`
+- `lastCatchUpAt`
 - `lastError`
 
 `phase` is one of:

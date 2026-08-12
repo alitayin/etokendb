@@ -14,13 +14,13 @@ export interface ApplicationRuntime {
 interface RuntimeOptions {
   logger?: Logger;
   createServer?: (dataService: ApiDataService, port: number) => Server;
-  listen?: (server: Server, port: number) => Promise<void>;
+  listen?: (server: Server, port: number, host: string) => Promise<void>;
   closeServer?: (server: Server) => Promise<void>;
 }
 
 export function toApiDataService(service: AgoraTokenService): ApiDataService {
   return {
-    isHealthy: () => service.getStatus().phase !== "error",
+    isHealthy: () => service.isHealthy(),
     isReady: () => service.isReady(),
     getStatus: () => service.getStatus(),
     listTokens: (query) => service.listTokens(query),
@@ -53,7 +53,7 @@ export function toApiDataService(service: AgoraTokenService): ApiDataService {
   };
 }
 
-export function listenServer(server: Server, port: number): Promise<void> {
+export function listenServer(server: Server, port: number, host: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error) => {
       cleanup();
@@ -68,7 +68,7 @@ export function listenServer(server: Server, port: number): Promise<void> {
     };
 
     server.once("error", onError);
-    server.listen(port, onListening);
+    server.listen(port, host, onListening);
   });
 }
 
@@ -104,7 +104,7 @@ export async function startApplication(
   const closeServerFn = options.closeServer ?? closeServer;
 
   logger.info(
-    `server bootstrapping | chronik=${config.chronikUrl} | sqlite=${config.sqlitePath} | port=${config.serverPort}`,
+    `server bootstrapping | chronik=${config.chronikUrl} | sqlite=${config.sqlitePath} | listen=${config.serverHost}:${config.serverPort}`,
   );
 
   await service.start();
@@ -112,7 +112,7 @@ export async function startApplication(
   let server: Server | null = null;
   try {
     server = createServerFn(toApiDataService(service), config.serverPort);
-    await listenFn(server, config.serverPort);
+    await listenFn(server, config.serverPort, config.serverHost);
   } catch (error) {
     service.stop();
     if (server) {

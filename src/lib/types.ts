@@ -44,6 +44,14 @@ export interface ActiveTokenSeed {
   kind: ActiveTokenGroupKind;
 }
 
+export type TokenSyncMode = "full" | "tail" | "catchup";
+
+export interface ChainSyncCursor {
+  blockHeight: number;
+  blockHash: string;
+  updatedAt: number;
+}
+
 export interface ProcessedTradeRecord {
   offerTxid: string;
   offerOutIdx: number;

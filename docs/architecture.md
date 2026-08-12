@@ -44,15 +44,21 @@
    - Dirty tokens get tail-synced over the newest N pages.
    - `AGR0` WebSocket events discover newly listed tokens immediately.
    - Active token discovery still runs on a low-frequency interval as a safety reconciliation.
+   - A persistent finalized-block cursor covers WebSocket downtime. Each block
+     is inspected for Agora activity and only affected token histories are
+     synchronized back to the saved block height.
+   - The cursor advances only after all affected token synchronizations succeed.
 5. Reorg safety:
+   - Validate the persisted finalized block hash before advancing.
    - Keep minimal trade rows with spend tx metadata.
-   - Reorg repair is still a future iteration.
+   - Automatic repair after a finalized-block hash mismatch is still a future iteration.
 
 ## Core entities
 
 - `tracked_tokens`
 - `processed_trades`
 - `token_stats`
+- `chain_sync_state`
 - `dirty_token_queue` in memory
 
 ## Questions to answer in the first implementation

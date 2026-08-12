@@ -693,8 +693,13 @@ components:
         - bootstrapTokenCount
         - bootstrapReadyCount
         - discoveryPageCount
+        - chainCursorHeight
+        - chainLagBlocks
+        - pendingTokenCount
+        - wsReconnectAttempts
         - lastDiscoveryAt
         - lastTipUpdateAt
+        - lastCatchUpAt
         - lastError
       properties:
         healthy:
@@ -740,11 +745,25 @@ components:
           type: integer
         discoveryPageCount:
           type: integer
+        chainCursorHeight:
+          type: integer
+          nullable: true
+        chainLagBlocks:
+          type: integer
+          nullable: true
+        pendingTokenCount:
+          type: integer
+        wsReconnectAttempts:
+          type: integer
         lastDiscoveryAt:
           type: string
           format: date-time
           nullable: true
         lastTipUpdateAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastCatchUpAt:
           type: string
           format: date-time
           nullable: true

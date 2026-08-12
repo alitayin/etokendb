@@ -72,6 +72,7 @@ npm start -- --defer-known-trade-count-lte=5
 - `npm run start:skip-lte1`
 - `npm run check`
 - `npm test`
+- `npm run backup`
 - `npm run report:status`
 - `npm run report:tokens`
 - `npm run report:token -- <tokenId>`

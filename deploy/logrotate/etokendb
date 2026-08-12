@@ -1,0 +1,10 @@
+/root/.pm2/logs/etokendb-out.log /root/.pm2/logs/etokendb-error.log {
+    daily
+    maxsize 50M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

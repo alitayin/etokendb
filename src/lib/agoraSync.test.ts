@@ -17,6 +17,7 @@ const BASE_CONFIG: AppConfig = {
   chronikUrl: "https://example.invalid",
   sqlitePath: ":memory:",
   serverPort: 8787,
+  serverHost: "127.0.0.1",
   activeGroupPageSize: 50,
   historyPageSize: 50,
   tailPageCount: 2,
@@ -35,6 +36,8 @@ const BASE_CONFIG: AppConfig = {
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
+  readinessMaxTipAgeMs: 5 * 60_000,
+  blockCatchUpBatchSize: 100,
 };
 
 function makeTakenOffer(params: {
@@ -471,6 +474,83 @@ test("tail sync scans multiple pages so new trades on page 1 are not missed", as
       lastTradeBlockTimestamp: 1003,
       lastTradePriceNanosatsPerAtom: "10000000000",
     });
+  } finally {
+    db.close();
+  }
+});
+
+test("catch-up sync pages backward until it reaches the saved block", async () => {
+  const tokenId = "token-catchup";
+  const db = openDatabase(":memory:");
+
+  try {
+    const deps = makeDeps([
+      {
+        rawTxs: [
+          makeRawSpendTx({
+            spendTxid: "spend-new",
+            offerTxid: "offer-new",
+            blockHeight: 105,
+          }),
+        ],
+        offers: [
+          makeTakenOffer({
+            offerTxid: "offer-new",
+            tokenId,
+            paidSats: 100n,
+            soldAtoms: 10n,
+          }),
+        ],
+      },
+      {
+        rawTxs: [
+          makeRawSpendTx({
+            spendTxid: "spend-checkpoint",
+            offerTxid: "offer-checkpoint",
+            blockHeight: 100,
+          }),
+        ],
+        offers: [
+          makeTakenOffer({
+            offerTxid: "offer-checkpoint",
+            tokenId,
+            paidSats: 200n,
+            soldAtoms: 20n,
+          }),
+        ],
+      },
+      {
+        rawTxs: [
+          makeRawSpendTx({
+            spendTxid: "spend-old",
+            offerTxid: "offer-old",
+            blockHeight: 90,
+          }),
+        ],
+        offers: [
+          makeTakenOffer({
+            offerTxid: "offer-old",
+            tokenId,
+            paidSats: 300n,
+            soldAtoms: 30n,
+          }),
+        ],
+      },
+    ]);
+
+    const result = await syncTokenHistory(
+      db,
+      deps,
+      BASE_CONFIG,
+      tokenId,
+      "catchup",
+      undefined,
+      100,
+    );
+
+    assert.equal(result.pageCount, 2);
+    assert.equal(result.insertedTradeCount, 2);
+    assert.equal(db.getTokenStats(tokenId)?.tradeCount, 2);
   } finally {
     db.close();
   }

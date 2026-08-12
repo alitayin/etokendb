@@ -12,6 +12,7 @@ export interface AppConfig {
   chronikUrls?: string[];
   sqlitePath: string;
   serverPort: number;
+  serverHost: string;
   activeGroupPageSize: number;
   historyPageSize: number;
   tailPageCount: number;
@@ -31,6 +32,8 @@ export interface AppConfig {
   requestTimeoutMs: number;
   requestRetryCount: number;
   wsConnectTimeoutMs: number;
+  readinessMaxTipAgeMs: number;
+  blockCatchUpBatchSize: number;
 }
 
 function readChronikUrls(): string[] {
@@ -110,6 +113,7 @@ export function loadConfig(): AppConfig {
     chronikUrls,
     sqlitePath: process.env.SQLITE_PATH?.trim() || "./data/etokendb.sqlite",
     serverPort: readPositiveInt("SERVER_PORT", 8787),
+    serverHost: process.env.SERVER_HOST?.trim() || "127.0.0.1",
     activeGroupPageSize: readPositiveInt("ACTIVE_GROUP_PAGE_SIZE", 50),
     historyPageSize: readPositiveInt("HISTORY_PAGE_SIZE", 200),
     tailPageCount: readPositiveInt("TAIL_PAGE_COUNT", 2),
@@ -144,5 +148,7 @@ export function loadConfig(): AppConfig {
     requestTimeoutMs: readPositiveInt("REQUEST_TIMEOUT_MS", 20_000),
     requestRetryCount: readPositiveInt("REQUEST_RETRY_COUNT", 3),
     wsConnectTimeoutMs: readPositiveInt("WS_CONNECT_TIMEOUT_MS", 10_000),
+    readinessMaxTipAgeMs: readPositiveInt("READINESS_MAX_TIP_AGE_MS", 5 * 60_000),
+    blockCatchUpBatchSize: readPositiveInt("BLOCK_CATCHUP_BATCH_SIZE", 100),
   };
 }

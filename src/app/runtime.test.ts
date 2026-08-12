@@ -16,6 +16,7 @@ const BASE_CONFIG: AppConfig = {
   chronikUrl: "https://example.invalid",
   sqlitePath: ":memory:",
   serverPort: 8787,
+  serverHost: "127.0.0.1",
   activeGroupPageSize: 50,
   historyPageSize: 50,
   tailPageCount: 2,
@@ -34,6 +35,8 @@ const BASE_CONFIG: AppConfig = {
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
+  readinessMaxTipAgeMs: 5 * 60_000,
+  blockCatchUpBatchSize: 100,
 };
 
 function makeService() {
@@ -41,6 +44,7 @@ function makeService() {
     start: async () => {},
     stop: () => {},
     isReady: () => true,
+    isHealthy: () => true,
     getStatus: () => ({
       ready: true,
       phase: "ready" as const,
@@ -61,8 +65,13 @@ function makeService() {
       bootstrapTokenCount: 1,
       bootstrapReadyCount: 1,
       discoveryPageCount: 1,
+      chainCursorHeight: 900_000,
+      chainLagBlocks: 0,
+      pendingTokenCount: 0,
+      wsReconnectAttempts: 0,
       lastDiscoveryAt: null,
       lastTipUpdateAt: null,
+      lastCatchUpAt: null,
       lastError: null,
     }),
     listTokens: () => ({ page: 1, pageSize: 50, total: 0, items: [] }),
@@ -151,6 +160,7 @@ function makeService() {
 
 test("startApplication waits for bootstrap before listening", async () => {
   const steps: string[] = [];
+  const listenArgs: Array<{ port: number; host: string }> = [];
   let releaseStart: (() => void) | null = null;
   const waitForStart = new Promise<void>((resolve) => {
     releaseStart = resolve;
@@ -174,8 +184,9 @@ test("startApplication waits for bootstrap before listening", async () => {
         steps.push("create-server");
         return fakeServer;
       },
-      listen: async () => {
+      listen: async (_server, port, host) => {
         steps.push("listen");
+        listenArgs.push({ port, host });
       },
       closeServer: async () => {},
     },
@@ -188,6 +199,7 @@ test("startApplication waits for bootstrap before listening", async () => {
   const runtime = await runtimePromise;
 
   assert.deepEqual(steps, ["start-begin", "start-end", "create-server", "listen"]);
+  assert.deepEqual(listenArgs, [{ port: 8787, host: "127.0.0.1" }]);
   await runtime.close();
 });
 

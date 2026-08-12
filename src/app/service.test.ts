@@ -49,6 +49,7 @@ const BASE_CONFIG: AppConfig = {
   chronikUrl: "https://example.invalid",
   sqlitePath: ":memory:",
   serverPort: 8787,
+  serverHost: "127.0.0.1",
   activeGroupPageSize: 50,
   historyPageSize: 50,
   tailPageCount: 2,
@@ -67,6 +68,8 @@ const BASE_CONFIG: AppConfig = {
   requestTimeoutMs: 5_000,
   requestRetryCount: 2,
   wsConnectTimeoutMs: 5_000,
+  readinessMaxTipAgeMs: 5 * 60_000,
+  blockCatchUpBatchSize: 100,
 };
 
 const REVIEW_AUTHOR_ADDRESS =
@@ -315,6 +318,7 @@ test("service performs tail catch-up before marking bootstrap token ready", asyn
   });
 
   const ws = {
+    ws: { readyState: 1 },
     subscribeToBlocks: () => {},
     waitForOpen: async () => {},
     close: () => {},
@@ -1336,9 +1340,8 @@ test("service rejects startup when a bootstrap token fails initialization", asyn
   }
 });
 
-test("service performs a polling catch-up before ready when websocket bootstrap is unavailable", async () => {
+test("service establishes a cursor without scanning every token when block APIs are unavailable", async () => {
   const db = openDatabase(":memory:");
-  const tipHeights = [900_100, 900_101, 900_101];
   const modes: string[] = [];
 
   const service = new AgoraTokenService(
@@ -1358,7 +1361,7 @@ test("service performs a polling catch-up before ready when websocket bootstrap 
           }) as never,
         blockchainInfo: async () => ({
           tipHash: "tip",
-          tipHeight: tipHeights.shift() ?? 900_101,
+          tipHeight: 900_101,
         }),
       },
       agora: {
@@ -1402,24 +1405,27 @@ test("service performs a polling catch-up before ready when websocket bootstrap 
 
   try {
     await service.start();
-    assert.deepEqual(modes, ["full", "tail"]);
+    assert.deepEqual(modes, ["full"]);
     assert.equal(service.isReady(), true);
     assert.equal(service.getStatus().phase, "degraded");
+    assert.equal(service.getStatus().chainCursorHeight, 900_101);
   } finally {
     service.stop();
     db.close();
   }
 });
 
-test("service performs tail catch-up after websocket reconnect", async () => {
+test("service recreates websocket and restores all subscriptions after disconnect", async () => {
   const db = openDatabase(":memory:");
   const modes: string[] = [];
-  let wsConfig:
-    | {
-        onConnect?: (event: unknown) => void;
-        onReconnect?: (event: unknown) => void;
-      }
-    | undefined;
+  const wsConfigs: Array<{
+    autoReconnect?: boolean;
+    onConnect?: (event: never) => void;
+    onEnd?: (event: never) => void;
+  }> = [];
+  const blockSubscriptions: number[] = [];
+  const lokadSubscriptions: Array<{ endpoint: number; lokadId: string }> = [];
+  const tokenSubscriptions: Array<{ endpoint: number; tokenId: string }> = [];
 
   const service = new AgoraTokenService(
     db,
@@ -1429,10 +1435,17 @@ test("service performs tail catch-up after websocket reconnect", async () => {
         plugin: () => ({}) as never,
         tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
         ws: (config) => {
-          wsConfig = config as typeof wsConfig;
+          const endpoint = wsConfigs.length;
+          wsConfigs.push(config as (typeof wsConfigs)[number]);
           return {
-            subscribeToBlocks: () => {},
-            waitForOpen: async () => {},
+            endpoint,
+            ws: { readyState: 1 },
+            subscribeToBlocks: () => blockSubscriptions.push(endpoint),
+            subscribeToLokadId: (lokadId: string) =>
+              lokadSubscriptions.push({ endpoint, lokadId }),
+            waitForOpen: async () => {
+              wsConfigs[endpoint]?.onConnect?.({} as never);
+            },
             close: () => {},
           } as never;
         },
@@ -1445,7 +1458,14 @@ test("service performs tail catch-up after websocket reconnect", async () => {
         historicOffers: async () => {
           throw new Error("unused");
         },
-        subscribeWs: () => {},
+        subscribeWs: (ws, params) => {
+          if (params.type === "TOKEN_ID") {
+            tokenSubscriptions.push({
+              endpoint: (ws as unknown as { endpoint: number }).endpoint,
+              tokenId: params.tokenId,
+            });
+          }
+        },
         unsubscribeWs: () => {},
         offeredFungibleTokenIds: async () => [],
       },
@@ -1477,6 +1497,7 @@ test("service performs tail catch-up after websocket reconnect", async () => {
           };
         },
       },
+      retryDelayMsFactory: () => 0,
     },
   );
 
@@ -1484,12 +1505,429 @@ test("service performs tail catch-up after websocket reconnect", async () => {
     await service.start();
     assert.deepEqual(modes, ["full"]);
 
-    wsConfig?.onReconnect?.({});
-    wsConfig?.onConnect?.({});
-    await new Promise((resolve) => setImmediate(resolve));
+    wsConfigs[0]?.onEnd?.({} as never);
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
-    assert.deepEqual(modes, ["full", "tail"]);
+    assert.equal(wsConfigs.length, 2);
+    assert.deepEqual(
+      wsConfigs.map((config) => config.autoReconnect),
+      [false, false],
+    );
+    assert.deepEqual(blockSubscriptions, [0, 1]);
+    assert.deepEqual(lokadSubscriptions, [
+      { endpoint: 0, lokadId: "41475230" },
+      { endpoint: 1, lokadId: "41475230" },
+    ]);
+    assert.deepEqual(tokenSubscriptions, [
+      { endpoint: 0, tokenId: "token-reconnect" },
+      { endpoint: 1, tokenId: "token-reconnect" },
+    ]);
+    assert.deepEqual(modes, ["full"]);
     assert.equal(service.getStatus().phase, "ready");
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("service retries when waitForOpen returns without an open socket", async () => {
+  const db = openDatabase(":memory:");
+  const endpoints: Array<{ readyState: number | null }> = [];
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () => {
+          const endpoint = endpoints.length;
+          const socket = endpoint === 0 ? undefined : { readyState: 1 };
+          endpoints.push({ readyState: socket?.readyState ?? null });
+          return {
+            ws: socket,
+            subscribeToBlocks: () => {},
+            subscribeToLokadId: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          } as never;
+        },
+        blockchainInfo: async () => ({ tipHash: "tip", tipHeight: 100 }),
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      retryDelayMsFactory: () => 0,
+      ops: { discoverActiveTokens: async () => [] },
+    },
+  );
+
+  try {
+    await service.start();
+    assert.equal(service.getStatus().phase, "degraded");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(endpoints, [{ readyState: null }, { readyState: 1 }]);
+    assert.equal(service.getStatus().wsConnected, true);
+    assert.equal(service.getStatus().phase, "ready");
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("first cursor startup rewinds finalized blocks and syncs only affected tokens", async () => {
+  const db = openDatabase(":memory:");
+  const tokenA = "a".repeat(64);
+  const tokenB = "b".repeat(64);
+  const syncs: Array<{ tokenId: string; mode: string; afterHeight?: number }> = [];
+  const scannedHeights: number[] = [];
+
+  for (const tokenId of [tokenA, tokenB]) {
+    db.upsertTrackedToken({
+      tokenId,
+      groupHex: `46${tokenId}`,
+      groupPrefixHex: "46",
+      kind: "FUNGIBLE",
+    });
+    db.markTokenReady(tokenId, true, 1_000);
+  }
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            subscribeToLokadId: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({ tipHash: "block-112", tipHeight: 112 }),
+        block: async (height: string | number) => ({
+          blockInfo: {
+            height: Number(height),
+            hash: `block-${height}`,
+            isFinal: true,
+          },
+        }) as never,
+        blockTxs: async (height: string | number) => {
+          scannedHeights.push(Number(height));
+          return {
+            txs:
+              Number(height) === 110
+                ? [
+                    {
+                      txid: "agora-a",
+                      inputs: [
+                        {
+                          prevOut: { txid: "offer-a", outIdx: 0 },
+                          plugins: { agora: { groups: [`54${tokenA}`] } },
+                        },
+                      ],
+                      outputs: [],
+                    },
+                  ]
+                : [],
+            numPages: 1,
+            numTxs: Number(height) === 110 ? 1 : 0,
+          } as never;
+        },
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      deferKnownTradeCountLte: Number.MAX_SAFE_INTEGER,
+      ops: {
+        discoverActiveTokens: async () =>
+          [tokenA, tokenB].map((tokenId) => ({
+            tokenId,
+            groupHex: `46${tokenId}`,
+            groupPrefixHex: "46",
+            kind: "FUNGIBLE" as const,
+          })),
+        syncTokenHistory: async (
+          _db,
+          _deps,
+          _config,
+          tokenId,
+          mode,
+          _progress,
+          afterHeight,
+        ) => {
+          syncs.push({ tokenId, mode, afterHeight });
+          return {
+            tokenId,
+            pageCount: 1,
+            scannedTradeCount: 0,
+            insertedTradeCount: 0,
+          };
+        },
+      },
+    },
+  );
+
+  try {
+    await service.start();
+    assert.deepEqual(scannedHeights, [
+      101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
+    ]);
+    assert.deepEqual(syncs, [
+      { tokenId: tokenA, mode: "catchup", afterHeight: 100 },
+    ]);
+    assert.deepEqual(db.getChainSyncCursor(), {
+      blockHeight: 112,
+      blockHash: "block-112",
+      updatedAt: db.getChainSyncCursor()?.updatedAt,
+    });
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("failed block token sync leaves the persisted cursor unchanged", async () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "c".repeat(64);
+  db.upsertTrackedToken({
+    tokenId,
+    groupHex: `46${tokenId}`,
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady(tokenId, true, 1_000);
+  db.setChainSyncCursor(100, "block-100", 1_000);
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({ tipHash: "block-101", tipHeight: 101 }),
+        block: async (height: string | number) => ({
+          blockInfo: {
+            height: Number(height),
+            hash: `block-${height}`,
+            isFinal: true,
+          },
+        }) as never,
+        blockTxs: async () => ({
+          txs: [
+            {
+              txid: "agora-c",
+              inputs: [
+                {
+                  prevOut: { txid: "offer-c", outIdx: 0 },
+                  plugins: { agora: { groups: [`54${tokenId}`] } },
+                },
+              ],
+              outputs: [],
+            },
+          ],
+          numPages: 1,
+          numTxs: 1,
+        }) as never,
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      deferKnownTradeCountLte: Number.MAX_SAFE_INTEGER,
+      ops: {
+        discoverActiveTokens: async () => [
+          {
+            tokenId,
+            groupHex: `46${tokenId}`,
+            groupPrefixHex: "46",
+            kind: "FUNGIBLE",
+          },
+        ],
+        syncTokenHistory: async () => {
+          throw new Error("Chronik rate limited");
+        },
+      },
+    },
+  );
+
+  try {
+    await assert.rejects(service.start(), /Chronik rate limited/);
+    assert.deepEqual(db.getChainSyncCursor(), {
+      blockHeight: 100,
+      blockHash: "block-100",
+      updatedAt: 1_000,
+    });
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("tail sync failure remains dirty and retries", async () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "d".repeat(64);
+  let tailAttempts = 0;
+  db.upsertTrackedToken({
+    tokenId,
+    groupHex: `46${tokenId}`,
+    groupPrefixHex: "46",
+    kind: "FUNGIBLE",
+  });
+  db.markTokenReady(tokenId, true, 1_000);
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () =>
+          ({
+            txid: "tail-event",
+            inputs: [
+              {
+                prevOut: { txid: "offer-d", outIdx: 0 },
+                plugins: { agora: { groups: [`54${tokenId}`] } },
+              },
+            ],
+            outputs: [],
+          }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({ tipHash: "tip", tipHeight: 101 }),
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      deferKnownTradeCountLte: Number.MAX_SAFE_INTEGER,
+      retryDelayMsFactory: () => 0,
+      ops: {
+        discoverActiveTokens: async () => [
+          {
+            tokenId,
+            groupHex: `46${tokenId}`,
+            groupPrefixHex: "46",
+            kind: "FUNGIBLE",
+          },
+        ],
+        syncTokenHistory: async (_db, _deps, _config, syncedTokenId, mode) => {
+          assert.equal(syncedTokenId, tokenId);
+          assert.equal(mode, "tail");
+          tailAttempts += 1;
+          if (tailAttempts === 1) {
+            throw new Error("temporary tail failure");
+          }
+          return {
+            tokenId,
+            pageCount: 1,
+            scannedTradeCount: 0,
+            insertedTradeCount: 0,
+          };
+        },
+      },
+    },
+  );
+
+  try {
+    await service.start();
+    await (
+      service as unknown as { handleWsMessage: (msg: unknown) => Promise<void> }
+    ).handleWsMessage({
+      type: "Tx",
+      msgType: "TX_CONFIRMED",
+      txid: "tail-event",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(tailAttempts, 2);
+    assert.equal(service.getStatus().pendingTokenCount, 0);
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
+test("readiness becomes false when tip and catch-up timestamps are stale", async () => {
+  const db = openDatabase(":memory:");
+  let nowMs = 1_000;
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => ({ txid: "unused", inputs: [], outputs: [] }) as never,
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({ tipHash: "tip", tipHeight: 101 }),
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: () => {},
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      nowMs: () => nowMs,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      ops: { discoverActiveTokens: async () => [] },
+    },
+  );
+
+  try {
+    await service.start();
+    assert.equal(service.isReady(), true);
+    nowMs += BASE_CONFIG.readinessMaxTipAgeMs + 1;
+    assert.equal(service.isReady(), false);
+    assert.equal(service.getStatus().ready, false);
+    assert.equal(service.isHealthy(), true);
   } finally {
     service.stop();
     db.close();
@@ -1528,6 +1966,7 @@ test("service discovers new fungible tokens from AGR0 websocket events", async (
         },
         ws: () =>
           ({
+            ws: { readyState: 1 },
             subscribeToBlocks: () => {},
             subscribeToLokadId: (lokadId: string) => lokadIds.push(lokadId),
             waitForOpen: async () => {},
