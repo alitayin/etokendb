@@ -1615,14 +1615,18 @@ test("first cursor startup rewinds finalized blocks and syncs only affected toke
             close: () => {},
           }) as never,
         blockchainInfo: async () => ({ tipHash: "block-112", tipHeight: 112 }),
-        block: async (height: string | number) => ({
-          blockInfo: {
-            height: Number(height),
-            hash: `block-${height}`,
-            isFinal: true,
-          },
-        }) as never,
-        blockTxs: async (height: string | number) => {
+        block: async function (height: string | number) {
+          assert.equal(typeof this.blockchainInfo, "function");
+          return {
+            blockInfo: {
+              height: Number(height),
+              hash: `block-${height}`,
+              isFinal: true,
+            },
+          } as never;
+        },
+        blockTxs: async function (height: string | number) {
+          assert.equal(typeof this.blockchainInfo, "function");
           scannedHeights.push(Number(height));
           return {
             txs:

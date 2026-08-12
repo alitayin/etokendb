@@ -2282,7 +2282,7 @@ export class AgoraTokenService implements ServiceReadApi {
     if (!block) {
       throw new Error("Chronik block method is unavailable");
     }
-    return block(height);
+    return block.call(this.deps.chronik, height);
   }
 
   private async processBlockRange(
@@ -2307,10 +2307,18 @@ export class AgoraTokenService implements ServiceReadApi {
       let numPages = 1;
       while (page < numPages) {
         const history = await this.requestChronik(
-          () =>
-            (this.deps.chronik.blockTxs as NonNullable<
-              typeof this.deps.chronik.blockTxs
-            >)(height, page, BLOCK_TX_PAGE_SIZE),
+          () => {
+            const blockTxs = this.deps.chronik.blockTxs;
+            if (!blockTxs) {
+              throw new Error("Chronik block tx history method is unavailable");
+            }
+            return blockTxs.call(
+              this.deps.chronik,
+              height,
+              page,
+              BLOCK_TX_PAGE_SIZE,
+            );
+          },
           `Chronik block txs ${height} page ${page}`,
         );
         numPages = history.numPages;
