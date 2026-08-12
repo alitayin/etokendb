@@ -37,7 +37,8 @@ BOOTSTRAP_CONCURRENCY=8
 ACTIVE_GROUP_PAGE_SIZE=50
 HISTORY_PAGE_SIZE=200
 TAIL_PAGE_COUNT=2
-DISCOVERY_INTERVAL_MS=60000
+DISCOVERY_INTERVAL_MS=3600000
+DISCOVERY_PAGE_DELAY_MS=100
 TIP_REFRESH_INTERVAL_MS=60000
 POLL_INTERVAL_MS=60000
 REQUEST_TIMEOUT_MS=20000
@@ -50,6 +51,16 @@ REVIEW_BASE_FEE_SATS=10000000
 REVIEW_INVOICE_TTL_MS=1800000
 REVIEW_RETRY_INTERVAL_MS=60000
 ```
+
+For an owned Chronik with failover nodes, replace `CHRONIK_URL` with an
+ordered, comma-separated list. The first URL is preferred:
+
+```env
+CHRONIK_URLS=http://127.0.0.1:8331,https://chronik-native1.fabien.cash
+```
+
+`CHRONIK_URL` remains supported for a single endpoint. An owned node must load
+the Agora plugin; the public `chronik.e.cash` endpoint does not expose it.
 
 If the machine also needs a proxy:
 
@@ -85,6 +96,16 @@ Convenience script for the common `<= 1 trade` threshold:
 npm run start:skip-lte1
 ```
 
+To skip bootstrap history checks for every token already marked ready:
+
+```bash
+npm run start:skip-ready
+```
+
+This mode still initializes tokens that have never reached ready state. It also
+accepts that transactions missed while the service was offline are not repaired
+immediately at startup.
+
 ### Start under PM2
 
 ```bash
@@ -97,6 +118,13 @@ If you want the `tradeCount <= 1` bootstrap deferral mode under PM2, start it wi
 
 ```bash
 pm2 start npm --name etokendb -- run start:skip-lte1
+pm2 save
+```
+
+To run PM2 without rechecking known-ready token histories:
+
+```bash
+pm2 start npm --name etokendb -- run start:skip-ready
 pm2 save
 ```
 
@@ -122,13 +150,14 @@ Important:
 
 - `pm2 restart etokendb` keeps the existing start command.
 - Restarting does not switch bootstrap modes by itself.
-- To switch from normal startup to `start:skip-zero` or `start:skip-lte1`, recreate the PM2 process with the intended command.
+- To switch from normal startup to `start:skip-zero`, `start:skip-ready`, or
+  `start:skip-lte1`, recreate the PM2 process with the intended command.
 
 Example:
 
 ```bash
 pm2 delete etokendb
-pm2 start npm --name etokendb -- run start:skip-lte1
+pm2 start npm --name etokendb -- run start:skip-ready
 pm2 save
 ```
 
@@ -154,9 +183,20 @@ Notes:
 - During bootstrap, each active fungible token gets initialized.
 - If a token receives websocket activity while it is still initializing, it is marked dirty and gets a tail catch-up before it becomes ready.
 - If websocket is unavailable, the service falls back to polling mode and still completes bootstrap.
-- Every 60 seconds the service rediscovers newly active fungible tokens.
+- The WebSocket subscribes to the Agora `AGR0` LOKAD ID, so a fungible token is
+  discovered immediately when its first offer is confirmed.
+- Every hour by default, the service performs a complete active-group
+  reconciliation to recover from missed WebSocket events and update inactive
+  status. Set `DISCOVERY_INTERVAL_MS` to tune this safety sweep.
+- Discovery sweeps are single-flight. A slow or rate-limited sweep cannot
+  overlap the next scheduled sweep.
+- Discovery pages are paced by `DISCOVERY_PAGE_DELAY_MS` (100 ms by default)
+  instead of being sent as one burst.
 - Optional startup mode:
   `--skip-known-zero-trade-bootstrap` is a convenience alias for `--defer-known-trade-count-lte=0`.
+- Fast restart mode:
+  `--skip-known-ready-bootstrap` defers every previously-ready token out of
+  blocking bootstrap.
 - General startup mode:
   `--defer-known-trade-count-lte=N` keeps previously-ready tokens with `tradeCount <= N` out of blocking bootstrap. They remain queryable from existing DB data, and only get tail-synced later when websocket or polling marks them dirty.
 
@@ -352,13 +392,23 @@ These are review notes only. They do not change current business behavior.
 - Improvement direction:
   put it behind nginx/Caddy and add rate limiting or IP controls.
 
-### F. Websocket tx handling does not yet distinguish mempool from confirmed updates
+### F. Websocket tx handling uses confirmed updates only
 
 - Chronik websocket tx messages include mempool and confirmed lifecycle events.
-- The current service marks tokens dirty on any matching tx event.
-- Because trade storage only persists confirmed trades, a mempool-triggered tail sync can be a harmless no-op until confirmation arrives.
-- Improvement direction:
-  treat `TX_CONFIRMED` and block-driven catch-up as the real persistence trigger, while using mempool events only as an early hint.
+- The current service only marks tokens dirty on `TX_CONFIRMED` and ignores
+  mempool lifecycle messages.
+
+### G. Chronik request profile
+
+- Startup performs one complete active-group discovery and initializes the
+  selected bootstrap cohort.
+- While WebSocket is healthy, trade tail sync is event-driven per affected
+  token. New fungible tokens are discovered through the global `AGR0`
+  subscription.
+- The fixed background discovery load is one complete active-group sweep per
+  `DISCOVERY_INTERVAL_MS`, not one sweep per minute.
+- Configure `CHRONIK_URLS` with an owned Agora-enabled Chronik first and native
+  endpoints after it to get client-level failover.
 
 ## 7. Current macro stats
 

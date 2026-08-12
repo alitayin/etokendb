@@ -3,7 +3,9 @@ import test from "node:test";
 
 import { openDatabase } from "./db.js";
 import {
+  GROUP_PREFIX_ACTIVE_FUNGIBLE,
   discoverActiveTokens,
+  extractAgoraFungibleTokenIdsFromTx,
   extractAgoraTokenIdsFromTx,
   syncActiveTokens,
   syncTokenHistory,
@@ -105,10 +107,11 @@ function makeDeps(
       plugin: () =>
         ({
           groups: async (
-            _prefixHex: string,
+            prefixHex: string,
             startHex = "",
             pageSize = 50,
           ) => {
+            assert.equal(prefixHex, GROUP_PREFIX_ACTIVE_FUNGIBLE);
             void pageSize;
             const resolvedPage =
               groupPages.find((entry) => (entry.startHex ?? "") === startHex) ??
@@ -182,6 +185,10 @@ test("extractAgoraTokenIdsFromTx deduplicates ids from inputs and outputs", () =
   assert.deepEqual(extractAgoraTokenIdsFromTx(tx).sort(), [
     "aaaabbbb",
     "ccccdddd",
+    "eeeeffff",
+  ]);
+  assert.deepEqual(extractAgoraFungibleTokenIdsFromTx(tx).sort(), [
+    "aaaabbbb",
     "eeeeffff",
   ]);
 });

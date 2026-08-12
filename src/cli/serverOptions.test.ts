@@ -16,6 +16,13 @@ test("parseServerCliOptions supports zero-trade bootstrap skip flag", () => {
   );
 
   assert.deepEqual(
+    parseServerCliOptions(["--skip-known-ready-bootstrap"]),
+    {
+      deferKnownTradeCountLte: Number.MAX_SAFE_INTEGER,
+    },
+  );
+
+  assert.deepEqual(
     parseServerCliOptions(["--defer-known-trade-count-lte", "1"]),
     {
       deferKnownTradeCountLte: 1,

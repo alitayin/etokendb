@@ -5,7 +5,10 @@ import type { AppDatabase } from "./db.js";
 import { retryAsync, withTimeout } from "./async.js";
 import { DirtyTokenQueue } from "./dirtyTokenQueue.js";
 import {
+  AGORA_LOKAD_ID_HEX,
+  GROUP_PREFIX_ACTIVE_FUNGIBLE,
   discoverActiveTokens,
+  extractAgoraFungibleTokenIdsFromTx,
   extractAgoraTokenIdsFromTx,
   syncTokenHistory,
   type SyncDependencies,
@@ -16,10 +19,15 @@ export interface LiveStartResult {
   newlySubscribedTokenIds: string[];
 }
 
+const WS_TX_DEDUP_TTL_MS = 5 * 60 * 1000;
+
 export class AgoraLiveSyncService {
   private readonly queue = new DirtyTokenQueue();
   private readonly subscribedTokenIds = new Set<string>();
+  private readonly recentWsTxids = new Map<string, number>();
+  private readonly wsDiscoveredDuringRefresh = new Set<string>();
   private ws: WsEndpoint | null = null;
+  private refreshPromise: Promise<LiveStartResult> | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private discoveryTimer: NodeJS.Timeout | null = null;
   private flushInProgress = false;
@@ -42,6 +50,7 @@ export class AgoraLiveSyncService {
         });
       },
     });
+    this.ws.subscribeToLokadId?.(AGORA_LOKAD_ID_HEX);
     await withTimeout(
       this.ws.waitForOpen(),
       this.config.wsConnectTimeoutMs,
@@ -91,6 +100,7 @@ export class AgoraLiveSyncService {
       this.ws.close();
       this.ws = null;
     }
+    this.recentWsTxids.clear();
   }
 
   markDirty(tokenId: string): void {
@@ -99,7 +109,33 @@ export class AgoraLiveSyncService {
   }
 
   async refreshTrackedTokens(): Promise<LiveStartResult> {
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.refreshPromise = this.runTrackedTokenRefresh();
+    try {
+      return await this.refreshPromise;
+    } finally {
+      this.refreshPromise = null;
+    }
+  }
+
+  private async runTrackedTokenRefresh(): Promise<LiveStartResult> {
     const seeds = await discoverActiveTokens(this.deps, this.config);
+    const discoveredTokenIds = new Set(seeds.map((seed) => seed.tokenId));
+    for (const tokenId of this.wsDiscoveredDuringRefresh) {
+      if (discoveredTokenIds.has(tokenId)) {
+        continue;
+      }
+      seeds.push({
+        tokenId,
+        groupHex: `${GROUP_PREFIX_ACTIVE_FUNGIBLE}${tokenId}`,
+        groupPrefixHex: GROUP_PREFIX_ACTIVE_FUNGIBLE,
+        kind: "FUNGIBLE",
+      });
+    }
+    this.wsDiscoveredDuringRefresh.clear();
     this.db.markAllTrackedTokensInactive();
     for (const seed of seeds) {
       this.db.upsertTrackedToken(seed);
@@ -112,8 +148,21 @@ export class AgoraLiveSyncService {
       };
     }
 
+    const activeTokenIds = new Set(seeds.map((seed) => seed.tokenId));
+    for (const tokenId of this.subscribedTokenIds) {
+      if (activeTokenIds.has(tokenId)) {
+        continue;
+      }
+
+      this.deps.agora.unsubscribeWs(this.ws, {
+        type: "TOKEN_ID",
+        tokenId,
+      });
+      this.subscribedTokenIds.delete(tokenId);
+    }
+
     const newlySubscribed: string[] = [];
-    for (const tokenId of this.db.listTrackedTokenIds()) {
+    for (const tokenId of activeTokenIds) {
       if (this.subscribedTokenIds.has(tokenId)) {
         continue;
       }
@@ -137,24 +186,67 @@ export class AgoraLiveSyncService {
       return;
     }
 
+    const nowMs = Date.now();
+    const lastHandledAt = this.recentWsTxids.get(msg.txid);
+    if (
+      lastHandledAt !== undefined &&
+      nowMs - lastHandledAt < WS_TX_DEDUP_TTL_MS
+    ) {
+      return;
+    }
+    this.recentWsTxids.set(msg.txid, nowMs);
+
     const label = `Chronik tx lookup ${msg.txid}`;
-    const tx = await retryAsync(
-      () =>
-        withTimeout(
-          this.deps.chronik.tx(msg.txid),
-          this.config.requestTimeoutMs,
-          label,
-        ),
-      this.config.requestRetryCount,
-      label,
-    );
-    const tokenIds = extractAgoraTokenIdsFromTx(tx);
-    for (const tokenId of tokenIds) {
-      if (!this.subscribedTokenIds.has(tokenId)) {
-        continue;
+    try {
+      const tx = await retryAsync(
+        () =>
+          withTimeout(
+            this.deps.chronik.tx(msg.txid),
+            this.config.requestTimeoutMs,
+            label,
+          ),
+        this.config.requestRetryCount,
+        label,
+      );
+
+      for (const tokenId of extractAgoraFungibleTokenIdsFromTx(tx)) {
+        if (this.subscribedTokenIds.has(tokenId)) {
+          continue;
+        }
+
+        this.db.upsertTrackedToken({
+          tokenId,
+          groupHex: `${GROUP_PREFIX_ACTIVE_FUNGIBLE}${tokenId}`,
+          groupPrefixHex: GROUP_PREFIX_ACTIVE_FUNGIBLE,
+          kind: "FUNGIBLE",
+        });
+        if (this.refreshPromise) {
+          this.wsDiscoveredDuringRefresh.add(tokenId);
+        }
+        if (this.ws) {
+          this.deps.agora.subscribeWs(this.ws, {
+            type: "TOKEN_ID",
+            tokenId,
+          });
+          this.subscribedTokenIds.add(tokenId);
+        }
       }
 
-      this.markDirty(tokenId);
+      for (const tokenId of extractAgoraTokenIdsFromTx(tx)) {
+        if (this.subscribedTokenIds.has(tokenId)) {
+          this.markDirty(tokenId);
+        }
+      }
+    } catch (error) {
+      this.recentWsTxids.delete(msg.txid);
+      throw error;
+    } finally {
+      for (const [txid, handledAt] of this.recentWsTxids) {
+        if (nowMs - handledAt < WS_TX_DEDUP_TTL_MS) {
+          break;
+        }
+        this.recentWsTxids.delete(txid);
+      }
     }
   }
 

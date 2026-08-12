@@ -26,8 +26,12 @@
 ## Proposed pipeline
 
 1. Discovery:
-   - Enumerate active token ids from Agora plugin groups with `F` and `G` prefixes.
+   - Enumerate active fungible token ids from Agora plugin groups with the `F` prefix.
    - Seed `tracked_tokens`.
+   - Subscribe to the `AGR0` LOKAD ID and onboard newly listed fungible tokens
+     directly from confirmed WebSocket transactions.
+   - Keep low-frequency full group enumeration as reconciliation after missed
+     events or downtime.
    - Accept that historical-only tokens still need a second discovery source or a deeper chain scan.
 2. Backfill:
    - For each token, fetch raw `plugin.history(54 + tokenId)` and normalized `agora.historicOffers()` for the same page.
@@ -38,7 +42,8 @@
 4. Live sync:
    - WebSocket marks token ids dirty.
    - Dirty tokens get tail-synced over the newest N pages.
-   - Active token discovery still runs on a low-frequency interval to find newly listed tokens.
+   - `AGR0` WebSocket events discover newly listed tokens immediately.
+   - Active token discovery still runs on a low-frequency interval as a safety reconciliation.
 5. Reorg safety:
    - Keep minimal trade rows with spend tx metadata.
    - Reorg repair is still a future iteration.

@@ -59,6 +59,7 @@ Optional startup modes:
 
 ```bash
 npm run start:skip-zero
+npm run start:skip-ready
 npm run start:skip-lte1
 npm start -- --defer-known-trade-count-lte=5
 ```
@@ -67,6 +68,7 @@ npm start -- --defer-known-trade-count-lte=5
 
 - `npm start`
 - `npm run start:skip-zero`
+- `npm run start:skip-ready`
 - `npm run start:skip-lte1`
 - `npm run check`
 - `npm test`

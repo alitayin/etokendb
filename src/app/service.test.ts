@@ -1496,6 +1496,109 @@ test("service performs tail catch-up after websocket reconnect", async () => {
   }
 });
 
+test("service discovers new fungible tokens from AGR0 websocket events", async () => {
+  const db = openDatabase(":memory:");
+  const tokenId = "a".repeat(64);
+  const subscribedTokenIds: string[] = [];
+  const syncModes: string[] = [];
+  const lokadIds: string[] = [];
+  let txLookupCount = 0;
+
+  const service = new AgoraTokenService(
+    db,
+    {
+      chronik: {
+        token: async () => { throw new Error("unused"); },
+        plugin: () => ({}) as never,
+        tx: async () => {
+          txLookupCount += 1;
+          return {
+            txid: "new-offer",
+            inputs: [],
+            outputs: [
+              {
+                plugins: {
+                  agora: {
+                    groups: [`46${tokenId}`, `54${tokenId}`],
+                  },
+                },
+              },
+            ],
+          } as never;
+        },
+        ws: () =>
+          ({
+            subscribeToBlocks: () => {},
+            subscribeToLokadId: (lokadId: string) => lokadIds.push(lokadId),
+            waitForOpen: async () => {},
+            close: () => {},
+          }) as never,
+        blockchainInfo: async () => ({
+          tipHash: "tip",
+          tipHeight: 900_000,
+        }),
+      },
+      agora: {
+        historicOffers: async () => { throw new Error("unused"); },
+        subscribeWs: (_ws, params) => {
+          if (params.type === "TOKEN_ID") {
+            subscribedTokenIds.push(params.tokenId);
+          }
+        },
+        unsubscribeWs: () => {},
+        offeredFungibleTokenIds: async () => [],
+      },
+    },
+    BASE_CONFIG,
+    {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+      ops: {
+        discoverActiveTokens: async () => [],
+        syncTokenHistory: async (_db, _deps, _config, syncedTokenId, mode) => {
+          syncModes.push(`${syncedTokenId}:${mode}`);
+          return {
+            tokenId: syncedTokenId,
+            pageCount: 1,
+            scannedTradeCount: 0,
+            insertedTradeCount: 0,
+          };
+        },
+      },
+    },
+  );
+
+  try {
+    await service.start();
+    assert.deepEqual(lokadIds, ["41475230"]);
+
+    const wsMessage = {
+      type: "Tx",
+      msgType: "TX_CONFIRMED",
+      txid: "new-offer",
+    } as const;
+    const handleWsMessage = (
+      service as unknown as { handleWsMessage: (msg: unknown) => Promise<void> }
+    ).handleWsMessage.bind(service);
+    await handleWsMessage(wsMessage);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(db.getTrackedToken(tokenId)?.isActive, true);
+    assert.deepEqual(subscribedTokenIds, [tokenId]);
+    assert.deepEqual(syncModes, [`${tokenId}:full`, `${tokenId}:tail`]);
+
+    await handleWsMessage(wsMessage);
+    assert.equal(txLookupCount, 1);
+  } finally {
+    service.stop();
+    db.close();
+  }
+});
+
 test("service can defer known zero-trade tokens out of blocking bootstrap", async () => {
   const db = openDatabase(":memory:");
   db.upsertTrackedToken({

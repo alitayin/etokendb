@@ -9,6 +9,7 @@ import {
 
 export interface AppConfig {
   chronikUrl: string;
+  chronikUrls?: string[];
   sqlitePath: string;
   serverPort: number;
   activeGroupPageSize: number;
@@ -16,6 +17,7 @@ export interface AppConfig {
   tailPageCount: number;
   pollIntervalMs: number;
   discoveryIntervalMs: number;
+  discoveryPageDelayMs?: number;
   tipRefreshIntervalMs: number;
   bootstrapConcurrency: number;
   apiPageSizeDefault: number;
@@ -31,6 +33,25 @@ export interface AppConfig {
   wsConnectTimeoutMs: number;
 }
 
+function readChronikUrls(): string[] {
+  const rawUrls = process.env.CHRONIK_URLS?.trim();
+  if (rawUrls) {
+    const urls = rawUrls
+      .split(",")
+      .map((url) => url.trim())
+      .filter(Boolean);
+    if (urls.length === 0) {
+      throw new Error("CHRONIK_URLS must contain at least one URL");
+    }
+    return urls;
+  }
+
+  return [
+    process.env.CHRONIK_URL?.trim() ||
+      "https://chronik-native1.fabien.cash",
+  ];
+}
+
 function readPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) {
@@ -40,6 +61,20 @@ function readPositiveInt(name: string, fallback: number): number {
   const value = Number.parseInt(raw, 10);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer, got "${raw}"`);
+  }
+
+  return value;
+}
+
+function readNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer, got "${raw}"`);
   }
 
   return value;
@@ -68,17 +103,19 @@ function normalizeProxyEnv(): void {
 
 export function loadConfig(): AppConfig {
   normalizeProxyEnv();
+  const chronikUrls = readChronikUrls();
 
   return {
-    chronikUrl:
-      process.env.CHRONIK_URL?.trim() || "https://chronik-native1.fabien.cash",
+    chronikUrl: chronikUrls[0],
+    chronikUrls,
     sqlitePath: process.env.SQLITE_PATH?.trim() || "./data/etokendb.sqlite",
     serverPort: readPositiveInt("SERVER_PORT", 8787),
     activeGroupPageSize: readPositiveInt("ACTIVE_GROUP_PAGE_SIZE", 50),
     historyPageSize: readPositiveInt("HISTORY_PAGE_SIZE", 200),
     tailPageCount: readPositiveInt("TAIL_PAGE_COUNT", 2),
     pollIntervalMs: readPositiveInt("POLL_INTERVAL_MS", 60_000),
-    discoveryIntervalMs: readPositiveInt("DISCOVERY_INTERVAL_MS", 60_000),
+    discoveryIntervalMs: readPositiveInt("DISCOVERY_INTERVAL_MS", 60 * 60_000),
+    discoveryPageDelayMs: readNonNegativeInt("DISCOVERY_PAGE_DELAY_MS", 100),
     tipRefreshIntervalMs: readPositiveInt("TIP_REFRESH_INTERVAL_MS", 60_000),
     bootstrapConcurrency: readPositiveInt("BOOTSTRAP_CONCURRENCY", 8),
     apiPageSizeDefault: readPositiveInt("API_PAGE_SIZE_DEFAULT", 50),

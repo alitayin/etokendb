@@ -15,6 +15,7 @@ import type {
 } from "./types.js";
 
 export const AGORA_PLUGIN_NAME = "agora";
+export const AGORA_LOKAD_ID_HEX = "41475230";
 export const GROUP_PREFIX_ACTIVE_FUNGIBLE = "46";
 export const GROUP_PREFIX_ACTIVE_GROUP = "47";
 export const GROUP_PREFIX_TOKEN_ID = "54";
@@ -71,7 +72,9 @@ export interface SyncProgressHandlers {
 const require = createRequire(import.meta.url);
 
 export function createSyncDependencies(config: AppConfig): SyncDependencies {
-  const chronik = new (requireChronikClient())([config.chronikUrl]);
+  const chronik = new (requireChronikClient())(
+    config.chronikUrls ?? [config.chronikUrl],
+  );
   const agora = new (requireAgora())(chronik);
   return { chronik, agora };
 }
@@ -173,6 +176,25 @@ export function extractAgoraTokenIdsFromTx(tx: Tx): string[] {
 
   for (const output of tx.outputs) {
     collectEntries(output.plugins as Record<string, { groups: string[] }> | undefined);
+  }
+
+  return [...tokenIds];
+}
+
+export function extractAgoraFungibleTokenIdsFromTx(tx: Tx): string[] {
+  const tokenIds = new Set<string>();
+
+  for (const entry of [...tx.inputs, ...tx.outputs]) {
+    const groups = entry.plugins?.[AGORA_PLUGIN_NAME]?.groups;
+    if (!groups) {
+      continue;
+    }
+
+    for (const group of groups) {
+      if (group.startsWith(GROUP_PREFIX_ACTIVE_FUNGIBLE)) {
+        tokenIds.add(group.slice(GROUP_PREFIX_ACTIVE_FUNGIBLE.length));
+      }
+    }
   }
 
   return [...tokenIds];
@@ -319,16 +341,16 @@ export async function discoverActiveTokens(
 ): Promise<ActiveTokenSeed[]> {
   const plugin = deps.chronik.plugin(AGORA_PLUGIN_NAME);
   const tokenIds = new Set<string>();
-  let nextStart = GROUP_PREFIX_ACTIVE_FUNGIBLE;
+  let nextStart: string | undefined;
   let page = 0;
 
   do {
-    const label = `Agora active token discovery page starting at ${nextStart || "beginning"}`;
+    const label = `Agora active token discovery page starting at ${nextStart || GROUP_PREFIX_ACTIVE_FUNGIBLE}`;
     const groups = await retryAsync(
       () =>
         withTimeout(
           plugin.groups(
-            "",
+            GROUP_PREFIX_ACTIVE_FUNGIBLE,
             nextStart,
             config.activeGroupPageSize,
           ),
@@ -339,15 +361,9 @@ export async function discoverActiveTokens(
       label,
     );
 
-    let reachedNonFungibleGroup = false;
     let fungibleGroupCount = 0;
     for (const { group } of groups.groups) {
       if (!group.startsWith(GROUP_PREFIX_ACTIVE_FUNGIBLE)) {
-        if (tokenIds.size > 0) {
-          reachedNonFungibleGroup = true;
-          break;
-        }
-
         continue;
       }
 
@@ -357,18 +373,18 @@ export async function discoverActiveTokens(
 
     progress?.onDiscoveryPage?.({
       page,
-      startHex: nextStart,
+      startHex: nextStart ?? "",
       fetchedGroupCount: groups.groups.length,
       fungibleGroupCount,
       nextStart: groups.nextStart,
     });
 
-    if (reachedNonFungibleGroup) {
-      break;
-    }
-
     nextStart = groups.nextStart;
     page += 1;
+    const pageDelayMs = config.discoveryPageDelayMs ?? 100;
+    if (nextStart !== "" && pageDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
+    }
   } while (nextStart !== "");
 
   return [...tokenIds].map((tokenId) => ({

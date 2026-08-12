@@ -5,7 +5,10 @@ import type { TokenInfo, Tx, WsEndpoint, WsMsgClient } from "chronik-client";
 import { encodeCashAddress, encodeOutputScript } from "ecashaddrjs";
 
 import {
+  AGORA_LOKAD_ID_HEX,
+  GROUP_PREFIX_ACTIVE_FUNGIBLE,
   discoverActiveTokens,
+  extractAgoraFungibleTokenIdsFromTx,
   extractAgoraTokenIdsFromTx,
   syncTokenHistory,
   type SyncDependencies,
@@ -80,6 +83,8 @@ import type {
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
 const CANDLE_TIMEZONE = "Asia/Shanghai";
+const WS_TX_DEDUP_TTL_MS = 5 * 60 * 1000;
+const WS_TX_DEDUP_MAX_ENTRIES = 2_000;
 
 type TokenPhase = "pending" | "initializing" | "catching-up" | "ready" | "error";
 
@@ -108,6 +113,15 @@ interface BootstrapPlan {
 interface ApplyDiscoveryOptions {
   bootstrapTokenIds?: Set<string>;
   enqueueTokenIds?: Set<string>;
+}
+
+function toActiveFungibleSeed(tokenId: string): ActiveTokenSeed {
+  return {
+    tokenId,
+    groupHex: `${GROUP_PREFIX_ACTIVE_FUNGIBLE}${tokenId}`,
+    groupPrefixHex: GROUP_PREFIX_ACTIVE_FUNGIBLE,
+    kind: "FUNGIBLE",
+  };
 }
 
 export interface AgoraTokenServiceOptions {
@@ -447,6 +461,8 @@ export class AgoraTokenService implements ServiceReadApi {
   private readonly ops: CoordinatorOps;
   private readonly tokenStates = new Map<string, TokenRuntimeState>();
   private readonly subscribedTokenIds = new Set<string>();
+  private readonly recentWsTxids = new Map<string, number>();
+  private readonly wsDiscoveredDuringDiscovery = new Set<string>();
   private readonly queuedTokenIds = new Set<string>();
   private readonly pendingQueue: string[] = [];
   private readonly bootstrapResolvers = new Set<() => void>();
@@ -464,6 +480,7 @@ export class AgoraTokenService implements ServiceReadApi {
   private ready = false;
   private wsConnected = false;
   private wsSubscriptionRefreshNeeded = false;
+  private discoveryInProgress = false;
   private tipHeight: number | null = null;
   private bootstrapTokenCount = 0;
   private discoveryPageCount = 0;
@@ -559,6 +576,7 @@ export class AgoraTokenService implements ServiceReadApi {
       this.ws = null;
     }
     this.subscribedTokenIds.clear();
+    this.recentWsTxids.clear();
   }
 
   isReady(): boolean {
@@ -1443,7 +1461,7 @@ export class AgoraTokenService implements ServiceReadApi {
 
   private async bootstrap(): Promise<void> {
     this.phase = "discovering";
-    const seeds = await this.discoverTokens("bootstrap");
+    const seeds = await this.runDiscovery("bootstrap");
     const plan = this.buildBootstrapPlan(seeds);
     this.bootstrapTokenCount = plan.blockingSeeds.length;
     if (plan.skippedTradeThresholdSeeds.length > 0) {
@@ -1574,6 +1592,7 @@ export class AgoraTokenService implements ServiceReadApi {
       },
     });
     this.ws.subscribeToBlocks();
+    this.ws.subscribeToLokadId?.(AGORA_LOKAD_ID_HEX);
 
     try {
       await withTimeout(
@@ -1602,26 +1621,50 @@ export class AgoraTokenService implements ServiceReadApi {
       return;
     }
 
-    const tx = await retryAsync(
-      () =>
-        withTimeout(
-          this.deps.chronik.tx(msg.txid),
-          this.config.requestTimeoutMs,
-          `Chronik tx lookup ${msg.txid}`,
-        ),
-      this.config.requestRetryCount,
-      `Chronik tx lookup ${msg.txid}`,
-    );
+    const nowMs = Date.now();
+    const lastHandledAt = this.recentWsTxids.get(msg.txid);
+    if (
+      lastHandledAt !== undefined &&
+      nowMs - lastHandledAt < WS_TX_DEDUP_TTL_MS
+    ) {
+      return;
+    }
+    this.recentWsTxids.set(msg.txid, nowMs);
 
-    for (const tokenId of this.ops.extractAgoraTokenIdsFromTx(tx)) {
-      const state = this.tokenStates.get(tokenId);
-      if (!state || !state.active) {
-        continue;
+    try {
+      const tx = await retryAsync(
+        () =>
+          withTimeout(
+            this.deps.chronik.tx(msg.txid),
+            this.config.requestTimeoutMs,
+            `Chronik tx lookup ${msg.txid}`,
+          ),
+        this.config.requestRetryCount,
+        `Chronik tx lookup ${msg.txid}`,
+      );
+      const fungibleTokenIds = new Set(
+        extractAgoraFungibleTokenIdsFromTx(tx),
+      );
+
+      for (const tokenId of this.ops.extractAgoraTokenIdsFromTx(tx)) {
+        let state = this.tokenStates.get(tokenId);
+        if ((!state || !state.active) && fungibleTokenIds.has(tokenId)) {
+          this.activateFungibleTokenFromWs(tokenId);
+          state = this.tokenStates.get(tokenId);
+        }
+        if (!state || !state.active) {
+          continue;
+        }
+
+        state.dirty = true;
+        this.db.markTokenWsEvent(tokenId, nowMs);
+        this.enqueueToken(tokenId);
       }
-
-      state.dirty = true;
-      this.db.markTokenWsEvent(tokenId, Date.now());
-      this.enqueueToken(tokenId);
+    } catch (error) {
+      this.recentWsTxids.delete(msg.txid);
+      throw error;
+    } finally {
+      this.pruneRecentWsTxids(nowMs);
     }
   }
 
@@ -1641,8 +1684,42 @@ export class AgoraTokenService implements ServiceReadApi {
   }
 
   private async refreshDiscovery(): Promise<void> {
-    const seeds = await this.discoverTokens("background");
-    this.applyDiscoverySeeds(seeds);
+    if (this.discoveryInProgress) {
+      return;
+    }
+
+    this.discoveryInProgress = true;
+    try {
+      const seeds = await this.runDiscovery("background");
+      this.applyDiscoverySeeds(seeds);
+    } finally {
+      this.discoveryInProgress = false;
+    }
+  }
+
+  private async runDiscovery(
+    reason: "bootstrap" | "background",
+  ): Promise<ActiveTokenSeed[]> {
+    const ownsDiscoveryFlag = !this.discoveryInProgress;
+    if (ownsDiscoveryFlag) {
+      this.discoveryInProgress = true;
+    }
+
+    try {
+      const seeds = await this.discoverTokens(reason);
+      const tokenIds = new Set(seeds.map((seed) => seed.tokenId));
+      for (const tokenId of this.wsDiscoveredDuringDiscovery) {
+        if (!tokenIds.has(tokenId)) {
+          seeds.push(toActiveFungibleSeed(tokenId));
+        }
+      }
+      this.wsDiscoveredDuringDiscovery.clear();
+      return seeds;
+    } finally {
+      if (ownsDiscoveryFlag) {
+        this.discoveryInProgress = false;
+      }
+    }
   }
 
   private async discoverTokens(reason: "bootstrap" | "background"): Promise<ActiveTokenSeed[]> {
@@ -1675,6 +1752,20 @@ export class AgoraTokenService implements ServiceReadApi {
     for (const state of this.tokenStates.values()) {
       state.active = activeIds.has(state.tokenId);
       state.bootstrapCohort = bootstrapTokenIds.has(state.tokenId);
+    }
+
+    if (this.ws) {
+      for (const tokenId of this.subscribedTokenIds) {
+        if (activeIds.has(tokenId)) {
+          continue;
+        }
+
+        this.deps.agora.unsubscribeWs(this.ws, {
+          type: "TOKEN_ID",
+          tokenId,
+        });
+        this.subscribedTokenIds.delete(tokenId);
+      }
     }
 
     for (const seed of seeds) {
@@ -1713,6 +1804,44 @@ export class AgoraTokenService implements ServiceReadApi {
         tokenId,
       });
       this.subscribedTokenIds.add(tokenId);
+    }
+  }
+
+  private activateFungibleTokenFromWs(tokenId: string): void {
+    const tracked = this.db.getTrackedToken(tokenId);
+    this.db.upsertTrackedToken(toActiveFungibleSeed(tokenId));
+    if (this.discoveryInProgress) {
+      this.wsDiscoveredDuringDiscovery.add(tokenId);
+    }
+
+    const state = this.ensureTokenState(tokenId);
+    state.active = true;
+    if (tracked?.isReady) {
+      state.ready = true;
+    }
+
+    this.subscribeTrackedTokens([tokenId]);
+    if (state.ready) {
+      state.dirty = true;
+    } else {
+      this.db.markTokenInitPending(tokenId, Date.now());
+    }
+    this.enqueueToken(tokenId);
+
+    if (!tracked) {
+      this.logger.info(`ws discovered fungible token=${tokenId}`);
+    }
+  }
+
+  private pruneRecentWsTxids(nowMs: number): void {
+    for (const [txid, handledAt] of this.recentWsTxids) {
+      if (
+        nowMs - handledAt < WS_TX_DEDUP_TTL_MS &&
+        this.recentWsTxids.size <= WS_TX_DEDUP_MAX_ENTRIES
+      ) {
+        break;
+      }
+      this.recentWsTxids.delete(txid);
     }
   }
 

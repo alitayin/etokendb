@@ -12,6 +12,11 @@ export function parseServerCliOptions(argv: string[]): ServerCliOptions {
       continue;
     }
 
+    if (arg === "--skip-known-ready-bootstrap") {
+      deferKnownTradeCountLte = Number.MAX_SAFE_INTEGER;
+      continue;
+    }
+
     if (arg.startsWith("--defer-known-trade-count-lte=")) {
       const rawValue = arg.slice("--defer-known-trade-count-lte=".length);
       deferKnownTradeCountLte = parseNonNegativeInt(rawValue, arg);
@@ -34,6 +39,7 @@ export function parseServerCliOptions(argv: string[]): ServerCliOptions {
           "Usage:",
           "  tsx src/cli/server.ts",
           "  tsx src/cli/server.ts --skip-known-zero-trade-bootstrap",
+          "  tsx src/cli/server.ts --skip-known-ready-bootstrap",
           "  tsx src/cli/server.ts --defer-known-trade-count-lte 1",
         ].join("\n"),
       );
